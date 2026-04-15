@@ -59,13 +59,13 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String(100), unique=True, index=True, nullable=False)
     phone = Column(String(15), unique=True, index=True, nullable=False)
-    password_hash = Column(String(255), nullable=False)
+    password_hash = Column(String, nullable=True)
     
     # Both naming conventions for compatibility
     name = Column(String(100))
     full_name = Column(String(100), nullable=False)
     
-    role = Column(String(50), default="patient")  # customer | doctor | pharmacy | lab | admin
+    role = Column(SQLEnum(UserRole), default=UserRole.PATIENT) # customer | doctor | pharmacy | lab | admin
     is_active = Column(Boolean, default=True)
     is_verified = Column(Boolean, default=False)
     
@@ -97,7 +97,7 @@ class User(Base):
     auth_token = Column(String(500), nullable=True)
     last_login = Column(DateTime, nullable=True)
     
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
     
     # Relationships
@@ -148,7 +148,7 @@ class Clinic(Base):
     insurance_accepted = Column(JSONB)
     rating = Column(DECIMAL(3, 2), default=0.0)
     total_reviews = Column(Integer, default=0)
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, server_default=func.now())
     
     # Relationships
     doctors = relationship("Doctor", back_populates="clinic")
@@ -195,8 +195,8 @@ class Doctor(Base):
     is_available = Column(Boolean, default=True)
     
     is_verified = Column(Boolean, default=False)
-    wallet_balance = Column(Float, default=0.0)
-    created_at = Column(DateTime, default=datetime.now)
+    wallet_balance = Column(DECIMAL(10,2))
+    created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
     
     # Relationships
@@ -224,7 +224,7 @@ class DoctorSlot(Base):
     block_reason = Column(Text, nullable=True)
     
     appointment_id = Column(String(20), ForeignKey("appointments.id"), unique=True)
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, server_default=func.now())
     
     # Relationships
     doctor = relationship("Doctor", back_populates="slots")
@@ -249,7 +249,7 @@ class Appointment(Base):
     is_emergency = Column(Boolean, default=False)
     consultation_type = Column(String(20), default='in-person')
     
-    status = Column(String(20), default='confirmed')  # confirmed | completed | cancelled
+    status = Column(SQLEnum(AppointmentStatus), default=AppointmentStatus.CONFIRMED)  # confirmed | completed | cancelled
     consultation_fee = Column(Integer, nullable=False)
     payment_id = Column(Integer, ForeignKey("payments.id"))
     prescription = Column(Text)
@@ -260,7 +260,7 @@ class Appointment(Base):
     cancellation_reason = Column(String(100))
     cancelled_at = Column(DateTime)
     
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
     
     # Relationships
@@ -289,13 +289,16 @@ class AppointmentPayment(Base):
     razorpay_order_id = Column(String(100))
     razorpay_payment_id = Column(String(100))
     razorpay_signature = Column(String(255))
-    payment_status = Column(String(20), default="pending")
-    created_at = Column(DateTime, default=datetime.now)
+    payment_status = Column(SQLEnum(PaymentStatus), default=PaymentStatus.PENDING)
+    payment_method = Column(String(50), nullable=True)   # card / upi / netbanking
+    paid_at = Column(DateTime, nullable=True)
+    refund_id = Column(String(100), nullable=True)
+    refunded_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
     
     # Relationships
     appointment = relationship("Appointment", back_populates="appointment_payment", uselist=False)
-
 
 class Payment(Base):
     __tablename__ = "payments"
@@ -309,7 +312,7 @@ class Payment(Base):
     razorpay_signature = Column(String(255))
     status = Column(String(20), default="pending")  # pending | success | failed | refunded
     payment_method = Column(String(50))  # card, upi, netbanking
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
     
     # Relationships
@@ -351,7 +354,7 @@ class WalletTransaction(Base):
     appointment_id = Column(String(20), ForeignKey("appointments.id"), unique=True)  # Changed to String for consistency
     balance_before = Column(Integer)
     balance_after = Column(Integer, nullable=False)
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, server_default=func.now())
     
     # Relationships
     doctor = relationship("Doctor", back_populates="wallet_transactions")
@@ -371,7 +374,7 @@ class QRCode(Base):
     verification_token = Column(String(100), unique=True)
     is_used = Column(Boolean, default=False)
     used_at = Column(DateTime)
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, server_default=func.now())
     
     # Relationships
     appointment = relationship("Appointment", back_populates="qr_code_obj", uselist=False)
@@ -394,7 +397,7 @@ class FamilyMember(Base):
     phone = Column(String(15))
     allergies = Column(JSONB)
     medical_notes = Column(Text)
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
     
     # Relationship
@@ -415,7 +418,7 @@ class Address(Base):
     location_lat = Column(DECIMAL(10, 8))
     location_lng = Column(DECIMAL(11, 8))
     is_default = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
     
     # Relationship
@@ -460,7 +463,7 @@ class Notification(Base):
     related_entity_type = Column(String(50), nullable=True)
     related_entity_id = Column(String(50), nullable=True)
     
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, server_default=func.now())
     
     # Relationships
     user = relationship("User", back_populates="notifications")
@@ -487,7 +490,7 @@ class UploadedFile(Base):
     category = Column(String(50), nullable=False)
     description = Column(Text, nullable=True)
     is_active = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, server_default=func.now())
     deleted_at = Column(DateTime, nullable=True)
     
     # Relationships
@@ -517,7 +520,7 @@ class Prescription(Base):
     diagnosis = Column(Text, nullable=True)
     follow_up_required = Column(Boolean, default=False)
     
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, server_default=func.now())
     
     # Relationships
     user = relationship("User", back_populates="prescriptions")
@@ -578,7 +581,7 @@ class Pharmacy(Base):
     minimum_order_amount = Column(Float, default=0.0)
     total_orders = Column(Integer, default=0)
     
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
     
     # Relationships
@@ -644,7 +647,7 @@ class Medicine(Base):
     alternatives = Column(JSONB)  # Old format - keeping for backward compatibility
     alternative_medicines_ids = Column(JSONB)  # New format
     
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
     
     # Relationships
@@ -668,7 +671,7 @@ class Order(Base):
     contact_number = Column(String(15), nullable=False)
     
     order_status = Column(String(20), default='pending')  # pending | confirmed | processing | shipped | delivered | cancelled
-    payment_status = Column(String(20), default="pending")
+    payment_status = Column(SQLEnum(PaymentStatus), default=PaymentStatus.PENDING)
     delivery_type = Column(String(20))  # home | pickup
     payment_id = Column(Integer, ForeignKey("payments.id"))
     prescription_id = Column(Integer, ForeignKey("prescriptions.id"))
@@ -681,7 +684,7 @@ class Order(Base):
     delivered_at = Column(DateTime)
     notes = Column(Text)
     
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
     
     # Relationships
@@ -722,7 +725,7 @@ class StockEntry(Base):
     supplier_name = Column(String(100))
     purchase_price_per_unit = Column(Float)
     invoice_number = Column(String(100))
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, server_default=func.now())
     
     # Relationships
     medicine = relationship("Medicine", back_populates="stock_entries")
@@ -784,7 +787,7 @@ class Laboratory(Base):
     # ✅ NEW: Total tests completed
     total_tests_completed = Column(Integer, default=0)
     
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
     
     # Relationships
@@ -821,7 +824,7 @@ class LabTest(Base):
     fasting_required = Column(Boolean, default=False)
     
     is_available = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
     
     # Relationships
@@ -863,7 +866,7 @@ class LabBooking(Base):
     # ✅ NEW: Completed at
     completed_at = Column(DateTime)
     
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
     
     # Relationships
@@ -901,7 +904,7 @@ class EmergencyRequest(Base):
     assigned_clinic_id = Column(String(50), ForeignKey('clinics.id'))
     ambulance_eta = Column(Integer)
     
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, server_default=func.now())
     resolved_at = Column(DateTime)
     completed_at = Column(DateTime)
     
@@ -923,7 +926,7 @@ class AuditLog(Base):
     entity_type = Column(String(50))
     entity_id = Column(String(50))
     details = Column(JSONB)
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, server_default=func.now())
     
     # Relationships
     user = relationship("User", back_populates="audit_logs")

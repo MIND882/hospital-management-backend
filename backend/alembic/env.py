@@ -58,26 +58,20 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    """Run migrations in 'online' mode.
-
-    In this scenario we need to create an Engine
-    and associate a connection with the context.
-
-    """
-    # Use the application's engine (keeps DB config in one place)
     connectable = engine
 
     with connectable.connect() as connection:
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
+            version_table_schema="public",
+            include_schemas=True,
             compare_type=True,
             compare_server_default=True,
         )
 
-        with context.begin_transaction():
+        with context.begin_transaction():   # 🔥 INSIDE connection block
             context.run_migrations()
-
 
 if context.is_offline_mode():
     run_migrations_offline()

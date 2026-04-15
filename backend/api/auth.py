@@ -2,6 +2,8 @@
 import sys
 from pathlib import Path
 
+from urllib3 import request
+
 # Add backend directory to path for imports to work when running directly
 backend_dir = Path(__file__).parent.parent
 if str(backend_dir) not in sys.path:
@@ -31,7 +33,7 @@ security = HTTPBearer()
 
 # ==================== CONFIG ====================
 
-SECRET_KEY = "your-super-secret-key-change-in-production"  # Store in .env
+SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret")  # Store in .env
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 1440  # 1 day
 REFRESH_TOKEN_EXPIRE_DAYS = 7
@@ -180,18 +182,13 @@ async def send_otp_whatsapp(phone: str, otp: str) -> bool:
         print(f"❌ WhatsApp Exception: {str(e)}")
         return False
 def check_rate_limit(phone: str, db: Session) -> bool:
-    """
-    Check if user exceeded OTP rate limit
-    Returns True if within limit, False if exceeded
-    """
     one_hour_ago = datetime.now() - timedelta(hours=1)
-    
-    # ✅ YE 3 LINES CHANGE KARO (TOP PE IMPORT func add karna):
+
     count = db.query(func.count(User.id)).filter(
         User.phone == phone,
-        User.otp_expires_at >= one_hour_ago
+        User.updated_at >= one_hour_ago
     ).scalar()
-    
+
     return count < OTP_RATE_LIMIT_PER_HOUR
 
 # ==================== DEPENDENCY: Get Current User ====================
@@ -254,6 +251,7 @@ async def send_otp(
     
     # Generate OTP
     otp = generate_otp()
+    print(f"🔥 OTP for {request.phone}: {otp}")
     hashed_otp = hash_otp(otp)
     otp_expiry = datetime.now() + timedelta(minutes=OTP_EXPIRY_MINUTES)
     
@@ -264,11 +262,11 @@ async def send_otp(
         user.otp_expires_at = otp_expiry
     else:
        user = User(
-    email=f"user_{request.phone.replace('+', '').replace('-', '')}@temp.hospital.in",
+    email=f"user_{request.phone.replace('+','')}@temp.hospital.in",
     phone=request.phone,
-    full_name=f"Patient {request.phone[-4:]}",
+    full_name=f"Patient {request.phone[-4:]}",  # 🔥 FIX
     role="patient",
-    password_hash="",  # Empty for now
+    password_hash="",
     otp=hashed_otp,
     otp_expires_at=otp_expiry,
     is_verified=False
@@ -276,7 +274,7 @@ async def send_otp(
     db.add(user)
     
     db.commit()
-    
+    db.refresh(user)
     # 🔥 PRODUCTION: Send SMS + WhatsApp (Parallel)
     sms_task = asyncio.create_task(send_otp_sms(request.phone, otp))
     whatsapp_task = asyncio.create_task(send_otp_whatsapp(request.phone, otp))
@@ -308,7 +306,7 @@ async def send_otp(
             "sms": sms_success,
             "whatsapp": whatsapp_success
         },
-        "is_new_user": user.name is None
+        "is_new_user": user.full_name is None
     }
 
 @router.post("/verify-otp", response_model=AuthResponse)
@@ -383,11 +381,11 @@ async def verify_otp_endpoint(
         "user": {
             "id": user.id,
             "phone": user.phone,
-            "name": user.name,
+            "name": user.full_name,
             "email": user.email,
             "age": user.age,
             "gender": user.gender,
-            "is_profile_complete": bool(user.name and user.age)
+            "is_profile_complete": bool(user.full_name and user.age)
         }
     }
 @router.post("/complete-profile", response_model=AuthResponse)
@@ -404,7 +402,7 @@ async def complete_profile(
     """
     
     # Update user profile
-    current_user.name = request.name
+    current_user.full_name = request.name
     current_user.age = request.age
     current_user.gender = request.gender
     current_user.blood_group = request.blood_group
@@ -443,7 +441,7 @@ async def complete_profile(
         "user": {
             "id": current_user.id,
             "phone": current_user.phone,
-            "name": current_user.name,
+            "name": current_user.full_name,
             "email": current_user.email,
             "age": current_user.age,
             "gender": current_user.gender,
@@ -537,7 +535,7 @@ async def get_current_user_info(
     return {
         "id": current_user.id,
         "phone": current_user.phone,
-        "name": current_user.name,
+        "name": current_user.full_name,
         "email": current_user.email,
         "age": current_user.age,
         "gender": current_user.gender,

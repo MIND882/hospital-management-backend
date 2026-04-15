@@ -1,12 +1,11 @@
 import sys
 from pathlib import Path
-
 # Add backend directory to path for imports to work when running directly
 backend_dir = Path(__file__).parent.parent
 if str(backend_dir) not in sys.path:
     sys.path.insert(0, str(backend_dir))
 
-from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import and_
 import razorpay
@@ -14,7 +13,10 @@ import hashlib
 import hmac
 import json
 import os
-import qrcode
+try:
+    import qrcode
+except:
+    qrcode = None
 import base64
 from io import BytesIO
 from datetime import datetime, timedelta
@@ -110,6 +112,9 @@ def generate_qr_code(appointment_id: str, doctor_id: int, patient_id: int) -> st
     """
     📱 Generate QR code for appointment verification at clinic
     """
+    if not qrcode:
+        return None
+
     qr_data = {
         "appointment_id": appointment_id,
         "doctor_id": doctor_id,
@@ -127,7 +132,7 @@ def generate_qr_code(appointment_id: str, doctor_id: int, patient_id: int) -> st
     qr.add_data(json.dumps(qr_data))
     qr.make(fit=True)
     
-    img = qr.make_image(fill_color="#3B82F6", back_color="white")
+    img = qr.make_image(fill_color="black", back_color="white")
     buffered = BytesIO()
     img.save(buffered, format="PNG")
     return base64.b64encode(buffered.getvalue()).decode()
@@ -171,8 +176,7 @@ def credit_doctor_wallet(
         transaction_type="credit",
         description=f"Payment for appointment {appointment_id}",
         balance_before=wallet.current_balance,
-        balance_after=wallet.current_balance + amount,
-        metadata={"transaction_type": transaction_type}
+        balance_after=wallet.current_balance + amount
     )
     db.add(transaction)
     
@@ -381,7 +385,7 @@ async def create_payment_order(
                 "order_id": request.order_id,
                 "order_type": request.order_type.value,
                 "user_id": current_user.id,
-                "user_name": current_user.name,
+                "user_name": current_user.full_name,
                 "user_phone": current_user.phone
             },
             "partial_payment": False,
@@ -453,7 +457,7 @@ async def create_payment_order(
             **order_info["metadata"]
         },
         "user_details": {
-            "name": current_user.name,
+            "name": current_user.full_name,
             "email": current_user.email,
             "phone": current_user.phone
         },
@@ -465,7 +469,7 @@ async def create_payment_order(
             "description": order_info["description"],
             "order_id": razorpay_order["id"],
             "prefill": {
-                "name": current_user.name,
+                "name": current_user.full_name,
                 "email": current_user.email or "",
                 "contact": current_user.phone
             },
@@ -483,7 +487,6 @@ async def create_payment_order(
 @router.post("/verify", response_model=dict)
 async def verify_payment(
     request: VerifyPaymentRequest,
-    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -540,30 +543,30 @@ async def verify_payment(
             
             if not appointment:
                 raise HTTPException(status_code=404, detail="Appointment not found")
-            
+        
             payment = db.query(AppointmentPayment).filter(
                 AppointmentPayment.appointment_id == request.order_id
             ).first()
-            
+        
             if not payment:
                 raise HTTPException(status_code=404, detail="Payment record not found")
-            
+        
             # Update payment status
             payment.payment_status = PaymentStatus.PAID
             payment.razorpay_payment_id = request.razorpay_payment_id
             payment.razorpay_signature = request.razorpay_signature
             payment.paid_at = datetime.now()
-            
+        
             # Update appointment
             appointment.status = "confirmed"
-            
+        
             # Generate QR code
             qr_data = generate_qr_code(
                 appointment.id,
                 appointment.doctor_id,
                 current_user.id
             )
-            
+        
             qr_record = QRCode(
                 appointment_id=appointment.id,
                 qr_data=qr_data,
@@ -573,27 +576,24 @@ async def verify_payment(
                 expires_at=datetime.combine(appointment.date, appointment.time) + timedelta(hours=2)
             )
             db.add(qr_record)
-            
+        
             db.commit()
-            
-            # Background tasks
-            background_tasks.add_task(
-                credit_doctor_wallet,
+        
+            credit_doctor_wallet(
                 db,
                 appointment.doctor_id,
                 payment.doctor_share,
                 request.order_id
             )
-            
-            background_tasks.add_task(
-                send_payment_notification,
+        
+            send_payment_notification(
                 db,
                 current_user.id,
                 "Payment Successful",
                 f"Payment of ₹{payment.total_amount} successful. Your appointment with Dr. {appointment.doctor.name} is confirmed.",
                 "payment_success"
             )
-            
+        
             response_data = {
                 "appointment_id": appointment.id,
                 "doctor_name": appointment.doctor.name,
@@ -607,7 +607,7 @@ async def verify_payment(
                     "Bring any relevant medical reports"
                 ]
             }
-        
+
         elif request.order_type == OrderType.MEDICINE:
             order = db.query(Order).filter(
                 Order.id == request.order_id,
@@ -623,8 +623,7 @@ async def verify_payment(
             
             db.commit()
             
-            background_tasks.add_task(
-                send_payment_notification,
+            send_payment_notification(
                 db,
                 current_user.id,
                 "Order Confirmed",
@@ -637,7 +636,7 @@ async def verify_payment(
                 "status": "processing",
                 "estimated_delivery": "Tomorrow by 6 PM" if order.delivery_type == "standard" else "Within 2 hours"
             }
-        
+
         else:  # LAB_TEST
             lab_booking = db.query(LabBooking).options(
                 joinedload(LabBooking.test)
@@ -645,7 +644,7 @@ async def verify_payment(
                 LabBooking.id == request.order_id,
                 LabBooking.user_id == current_user.id
             ).first()
-            
+
             if not lab_booking:
                 raise HTTPException(status_code=404, detail="Lab booking not found")
             
@@ -654,8 +653,7 @@ async def verify_payment(
             
             db.commit()
             
-            background_tasks.add_task(
-                send_payment_notification,
+            send_payment_notification(
                 db,
                 current_user.id,
                 "Lab Test Scheduled",
@@ -669,7 +667,7 @@ async def verify_payment(
                 "collection_date": str(lab_booking.collection_date),
                 "collection_type": lab_booking.collection_type
             }
-        
+
         # Log successful payment
         audit = AuditLog(
             user_id=current_user.id,
@@ -708,7 +706,6 @@ async def verify_payment(
 @router.post("/webhook/razorpay", include_in_schema=False)
 async def razorpay_webhook(
     request: Request,
-    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
     """
@@ -761,8 +758,7 @@ async def razorpay_webhook(
                 appointment.status = "confirmed"
                 
                 # Credit doctor wallet
-                background_tasks.add_task(
-                    credit_doctor_wallet,
+                credit_doctor_wallet(
                     db,
                     appointment.doctor_id,
                     payment.doctor_share,
@@ -810,7 +806,6 @@ async def razorpay_webhook(
 @router.post("/refund", response_model=dict)
 async def initiate_refund(
     request: RefundRequest,
-    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -882,8 +877,7 @@ async def initiate_refund(
             db.commit()
             
             # Debit doctor wallet
-            background_tasks.add_task(
-                debit_doctor_wallet,
+            debit_doctor_wallet(
                 db,
                 appointment.doctor_id,
                 payment.doctor_share,
@@ -892,8 +886,7 @@ async def initiate_refund(
             )
             
             # Send notification
-            background_tasks.add_task(
-                send_payment_notification,
+            send_payment_notification(
                 db,
                 current_user.id,
                 "Refund Initiated",
@@ -956,7 +949,7 @@ async def get_payment_history(
                 "order_id": payment.appointment_id,
                 "order_type": "appointment",
                 "amount": payment.total_amount,
-                "status": payment.payment_status.value if isinstance(payment.payment_status, Enum) else payment.payment_status,
+                "status": str(payment.payment_status) if payment.payment_status else "unknown",
                 "description": f"Dr. {appointment.doctor.name}" if appointment and appointment.doctor else "Appointment",
                 "date": payment.created_at.strftime("%Y-%m-%d %I:%M %p"),
                 "qr_available": db.query(QRCode).filter(
@@ -992,7 +985,7 @@ async def get_payment_status(
         return {
             "order_id": order_id,
             "order_type": "appointment",
-            "status": payment.payment_status.value if isinstance(payment.payment_status, Enum) else payment.payment_status,
+            "status": str(payment.payment_status) if payment.payment_status else "unknown",
             "amount": payment.total_amount,
             "payment_id": payment.razorpay_payment_id,
             "created_at": payment.created_at.strftime("%Y-%m-%d %I:%M %p") if payment.created_at else None,
@@ -1033,8 +1026,7 @@ async def get_payment_methods():
                 "name": "Wallets",
                 "icon": "👛",
                 "wallets": ["Paytm", "PhonePe", "Amazon Pay", "Freecharge"]
-            },
-    
+            }
         ],
         "currency": "INR",
         "razorpay_key_id": RAZORPAY_KEY_ID

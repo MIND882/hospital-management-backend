@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 
+from requests import request
+
 # Add backend directory to path for imports to work when running directly
 backend_dir = Path(__file__).parent.parent
 if str(backend_dir) not in sys.path:
@@ -21,6 +23,7 @@ from datetime import datetime, date, time, timedelta
 import secrets
 import hashlib
 import hmac
+from api.auth import create_access_token
 router = APIRouter(prefix="/api/doctor", tags=["Doctor Management"])
 
 # ==================== PYDANTIC MODELS ====================
@@ -37,7 +40,7 @@ class DoctorRegistrationRequest(BaseModel):
     # Doctor details
     full_name:str =Field(..., min_length=2, max_length=100)
     email: EmailStr = Field(..., description="Doctor's official email for login")
-    password_hash:str = Field(..., min_length=8, description="Set a strong password for login")
+    password: str = Field(..., min_length=8, description="Set a strong password for login")
     specialties: List[str] = Field(..., min_length=1, description="List of specialties")
     qualification: str = Field(..., min_length=2)
     experience_years: int = Field(..., ge=0, le=70)
@@ -265,12 +268,13 @@ async def register_doctor(
     # --- Step 2: Create User account with hashed password ---
     hashed_pwd = hash_password(request.password)
     new_user = User(
-        name=request.name,
-        email=request.email,
-        password=hashed_pwd,
-        role="doctor",                                   # Doctor role set karo
-        is_active=True,
-        created_at=datetime.now()
+      full_name=request.full_name,
+      email=request.email,
+      phone=f"DR{secrets.randbelow(1000000000)}",
+      password_hash=hashed_pwd,
+      role="doctor",
+      is_active=True,
+      created_at=datetime.now()
     )
     db.add(new_user)
     db.flush()                                           # new_user.id milega
@@ -321,8 +325,9 @@ async def register_doctor(
     doctor = Doctor(
         clinic_id=clinic_id,
         user_id=new_user.id,
-        name=request.name,
+        name=request.full_name,
         specialties=request.specialties,
+        specialization=request.specialties[0],
         qualification=request.qualification,
         experience_years=request.experience_years,
         consultation_fee=request.consultation_fee,
@@ -378,7 +383,7 @@ async def register_doctor(
         user_id=new_user.id,
         title="Welcome! 🎉",
         message=(
-            f"Dr. {request.name}, aapka registration successful hai. "
+            f"Dr. {request.full_name}, aapka registration successful hai. "
             f"Aapka profile abhi verification pending hai. "
             f"24-48 ghante mein admin verify karega."
         ),
@@ -446,7 +451,7 @@ async def login_doctor(
         )
 
     # --- Step 2: Password verify karo ---
-    if not verify_password(request.password, user.password):
+    if not verify_password(request.password, user.password_hash):
         raise HTTPException(
             status_code=401,
             detail="Incorrect password. Please try again."
@@ -461,8 +466,10 @@ async def login_doctor(
         )
 
     # --- Step 4: Token generate karo aur user pe store karo ---
-    token = generate_token()
-    user.auth_token = token
+    token = create_access_token({
+    "user_id": user.id,
+    "role": "doctor"
+})
     user.last_login = datetime.now()
     db.commit()
 
@@ -590,7 +597,7 @@ async def get_my_schedule(
             "slot_id": slot.id,
             "time": f"{slot.start_time.strftime('%I:%M %p')} - {slot.end_time.strftime('%I:%M %p')}",
             "status": "blocked" if slot.is_blocked else ("booked" if slot.is_booked else "available"),
-            "patient_name": appointment.user.name if appointment else None,
+            "patient_name": appointment.user.full_name if appointment else None,
             "patient_phone": appointment.user.phone if appointment else None,
             "appointment_id": appointment.id if appointment else None,
             "reason": appointment.reason if appointment else None
@@ -758,7 +765,7 @@ async def get_today_appointments(
             {
                 "id": apt.id,
                 "time": apt.time.strftime('%I:%M %p'),
-                "patient_name": apt.user.name,
+                "patient_name": apt.user.full_name,
                 "patient_phone": apt.user.phone,
                 "patient_age": apt.user.age,
                 "reason": apt.reason,
@@ -808,7 +815,7 @@ async def get_upcoming_appointments(
         grouped[date_str].append({
             "id": apt.id,
             "time": apt.time.strftime('%I:%M %p'),
-            "patient_name": apt.user.name,
+            "patient_name": apt.user.full_name,
             "patient_phone": apt.user.phone,
             "reason": apt.reason
         })
@@ -889,10 +896,6 @@ async def complete_appointment(
             description=f"Consultation fee — Appointment #{appointment.id}",
             balance_before=wallet.current_balance,
             balance_after=wallet.current_balance + credit_amount,
-            metadata={
-                "appointment_id": str(appointment.id),
-                "patient_user_id": appointment.user_id
-            }
         )
         db.add(credit_tx)
 
@@ -1011,18 +1014,13 @@ async def withdraw_earnings(
     
     # Create withdrawal transaction
     transaction = WalletTransaction(
-        wallet_id=wallet.id,
-        amount=request.amount,
-        transaction_type="withdrawal",
-        description=f"Withdrawal to {request.bank_account}",
-        balance_before=wallet.current_balance,
-        balance_after=wallet.current_balance - request.amount,
-        metadata={
-            "bank_account": request.bank_account,
-            "ifsc_code": request.ifsc_code,
-            "status": "pending"
-        }
-    )
+    wallet_id=wallet.id,
+    amount=request.amount,
+    transaction_type="withdrawal",
+    description=f"Withdrawal to {request.bank_account}",
+    balance_before=wallet.current_balance,
+    balance_after=wallet.current_balance - request.amount,
+)
     db.add(transaction)
     
     # Update wallet

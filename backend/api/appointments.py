@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import and_, or_, func
 from database.connection import get_db
 from database.models import User, Doctor, Clinic, DoctorSlot, Appointment, Notification, AuditLog, PaymentStatus, AppointmentPayment, DoctorWallet, WalletTransaction, QRCode
+from api.auth import get_current_user
 from pydantic import BaseModel, Field
 from api.payments import RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET
 from typing import List, Optional
@@ -26,7 +27,7 @@ import json
 from io import BytesIO
 from sqlalchemy import Enum as SQLEnum
 from enum import Enum as PyEnum
-from .payments import RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET
+
 
 router = APIRouter(prefix="/api/appointments", tags=["Appointments"])
 
@@ -71,15 +72,14 @@ class SlotResponse(BaseModel):
     display: str  # "3:00 PM"
 
 class AppointmentBookRequest(BaseModel):
-    user_id: int
     doctor_id: int
     slot_id: int
     date: date
     reason: Optional[str] = None
     symptoms: Optional[List[str]] = []
-    consultation_type: str = Field("in-person", description="in-person/video/phone")
+    consultation_type: str = Field("in-person")
     is_emergency: bool = False
-    payment_method: PaymentMethod = Field(PaymentMethod.ADVANCE, description="advance/pay_at_clinic")
+    payment_method: PaymentMethod = Field(PaymentMethod.ADVANCE)
 
 class AppointmentResponse(BaseModel):
     appointment_id: str
@@ -88,7 +88,6 @@ class AppointmentResponse(BaseModel):
 
 class CancellationRequest(BaseModel):
     appointment_id: str
-    user_id: int
     reason: Optional[str] = None
 
 # ==================== HELPER FUNCTIONS ====================
@@ -114,29 +113,36 @@ def calculate_distance(lat1: float, lng1: float, lat2: float, lng2: float) -> fl
 
 def generate_qr_code(appointment_id: str, doctor_id: int, patient_id: int) -> str:
     """Generate QR code for appointment verification"""
+
+    # Safety: if qrcode lib not installed
+    if not qrcode:
+        return ""
+
     qr_data = {
         "appointment_id": appointment_id,
         "doctor_id": doctor_id,
         "patient_id": patient_id,
         "timestamp": datetime.now().isoformat()
     }
-    
+
     qr = qrcode.QRCode(
         version=1,
         error_correction=qrcode.constants.ERROR_CORRECT_L,
         box_size=10,
         border=4,
     )
+
     qr.add_data(json.dumps(qr_data))
     qr.make(fit=True)
-    
+
     img = qr.make_image(fill_color="black", back_color="white")
+
     buffered = BytesIO()
     img.save(buffered, format="PNG")
-    img_str = base64.b64encode(buffered.getvalue()).decode()
-    
-    return img_str
 
+    img_str = base64.b64encode(buffered.getvalue()).decode()
+
+    return img_str
 def calculate_payment_breakdown(consultation_fee: int) -> dict:
     """Calculate 80-20 split for payment"""
     total_amount = consultation_fee
@@ -179,14 +185,13 @@ def credit_doctor_wallet(db: Session, doctor_id: int, amount: int, appointment_i
     db.add(transaction)
     db.commit()
     
-    # Send notification to doctor
+    # FIX: send_notification does not accept a `details` kwarg — removed it
     send_notification(
         db=db,
         user_id=db.query(Doctor).filter(Doctor.id == doctor_id).first().user_id,
         type="payment_received",
         title="Payment Received",
-        message=f"₹{amount} credited to wallet for appointment {appointment_id}",
-        details={"amount": amount, "appointment_id": appointment_id}
+        message=f"₹{amount} credited to wallet for appointment {appointment_id}"
     )
 
 
@@ -240,26 +245,32 @@ def send_booking_notifications(db: Session, appointment_id: str, doctor_name: st
         pass
 
 
-def send_notification(db: Session, user_id: int, type: str, title: str, message: str):
+def send_notification(
+    db: Session,
+    user_id: int,
+    type: str,
+    title: str,
+    message: str
+):
     """Create notification for user"""
     notification = Notification(
-        user_id=user_id,
-        type=type,
-        title=title,
-        message=message
-    )
+    user_id=user_id,
+    type=type,
+    title=title,
+    message=message
+)
     db.add(notification)
     db.commit()
 
 def log_action(db: Session, user_id: int, action: str, entity_type: str, entity_id: str, details: dict):
     """Create audit log entry"""
     audit = AuditLog(
-        user_id=user_id,
-        action=action,
-        entity_type=entity_type,
-        entity_id=entity_id,
-        details=details
-    )
+    user_id=user_id,
+    action=action,
+    entity_type=entity_type,
+    entity_id=entity_id,
+    details=details
+)
     db.add(audit)
     db.commit()
 
@@ -502,7 +513,8 @@ async def get_doctor_slots(
 @router.post("/book", response_model=AppointmentResponse)
 async def book_appointment(
     request: AppointmentBookRequest,
-    background_tasks: BackgroundTasks,
+    background_tasks: BackgroundTasks,  
+    current_user: User = Depends(get_current_user),# ✅ yaha hona chahiye
     db: Session = Depends(get_db)
 ):
     """
@@ -516,7 +528,8 @@ async def book_appointment(
     print(f"Booking request received: {request.dict()}")
     
     # ========== VALIDATION 1: USER EXISTS ==========
-    user = db.query(User).filter(User.id == request.user_id).first()
+
+    user = current_user
     if not user:
         raise HTTPException(
             status_code=404,
@@ -591,7 +604,7 @@ async def book_appointment(
         and_(
             Appointment.doctor_id == request.doctor_id,
             Appointment.date == request.date,
-            Appointment.status.in_(["confirmed", "payment_pending"])
+            Appointment.status.in_(["confirmed"])
         )
     ).count()
     
@@ -624,7 +637,7 @@ async def book_appointment(
                     "notes": {
                         "appointment_id": booking_id,
                         "patient_id": user.id,
-                        "patient_name": user.name,
+                        "patient_name": user.full_name,
                         "doctor_id": doctor.id,
                         "doctor_name": doctor.name,
                         "slot_id": slot.id,
@@ -650,9 +663,11 @@ async def book_appointment(
             payment_status = PaymentStatus.PENDING  # Will be paid later
         
         # ========== CREATE APPOINTMENT ==========
+        # FIX: Appointment model has no total_amount / platform_fee / doctor_share columns.
+        # Those belong on AppointmentPayment. Only set columns that exist on Appointment.
         appointment = Appointment(
             id=booking_id,
-            user_id=request.user_id,
+            user_id=current_user.id,
             doctor_id=request.doctor_id,
             slot_id=request.slot_id,
             date=request.date,
@@ -662,9 +677,7 @@ async def book_appointment(
             status=appointment_status,
             is_emergency=request.is_emergency,
             consultation_type=request.consultation_type,
-            total_amount=breakdown["total_amount"],
-            platform_fee=breakdown["platform_fee"],
-            doctor_share=breakdown["doctor_share"]
+            consultation_fee=doctor.consultation_fee
         )
         db.add(appointment)
         
@@ -706,8 +719,7 @@ async def book_appointment(
             )
             db.add(qr_record)
         
-        # ========== UPDATE DOCTOR STATS ==========
-        doctor.total_consultations += 1
+        
         
         # Update next available slot
         update_doctor_next_available_slot(db, doctor.id)
@@ -718,19 +730,18 @@ async def book_appointment(
         print(f"Appointment created: {booking_id}")
         
         # ========== SEND NOTIFICATIONS ==========
-        background_tasks.add_task(
-            send_booking_notifications,
-            db,
-            appointment.id,
-            doctor.name,
-            user.name,
-            request.payment_method.value
-        )
+        send_booking_notifications(
+                        db,
+                       appointment.id,
+                       doctor.name,
+                       user.full_name,
+                       request.payment_method.value
+                    )
         
         # ========== LOG ACTION ==========
         log_action(
             db=db,
-            user_id=request.user_id,
+            user_id=current_user.id,
             action="APPOINTMENT_BOOKED",
             entity_type="appointment",
             entity_id=booking_id,
@@ -747,10 +758,17 @@ async def book_appointment(
         
         # ========== PREPARE RESPONSE ==========
         response_data = {
-            "appointment_id": booking_id,
-            "status": appointment.status,
-            "message": "Appointment booking successful"
-        }
+    "appointment_id": booking_id,
+    "status": appointment.status,
+    "details": {   # 👈 YE ADD KAR (IMPORTANT)
+        "doctor_id": doctor.id,
+        "doctor_name": doctor.name,
+        "slot_id": slot.id,
+        "date": str(request.date),
+        "time": slot.start_time.strftime("%I:%M %p"),
+        "consultation_fee": doctor.consultation_fee
+    }
+}
         
         # ========== RESPONSE FOR ADVANCE PAYMENT ==========
         if request.payment_method == PaymentMethod.ADVANCE:
@@ -773,7 +791,7 @@ async def book_appointment(
                         "name": "MediBook Healthcare",
                         "description": f"Appointment with Dr. {doctor.name}",
                         "prefill": {
-                            "name": user.name,
+                            "name": user.full_name,
                             "email": user.email,
                             "contact": user.phone
                         },
@@ -790,7 +808,7 @@ async def book_appointment(
                 "payment_required": False,
                 "appointment_details": {
                     "booking_id": booking_id,
-                    "patient_name": user.name,
+                    "patient_name": user.full_name,
                     "patient_phone": user.phone,
                     "doctor_name": doctor.name,
                     "doctor_specialty": doctor.specialties[0] if doctor.specialties else "General",
@@ -830,8 +848,9 @@ async def book_appointment(
 @router.get("/user/{user_id}", response_model=dict)
 async def get_user_appointments(
     user_id: int,
-    status: Optional[str] = Query(None, description="confirmed/completed/cancelled"),
-    upcoming_only: bool = Query(False, description="Show only upcoming appointments"),
+    current_user: User = Depends(get_current_user),
+    status: Optional[str] = Query(None),
+    upcoming_only: bool = Query(False),
     db: Session = Depends(get_db)
 ):
     """
@@ -920,7 +939,7 @@ async def get_appointment_details(
     return {
         "id": appointment.id,
         "patient": {
-            "name": appointment.user.name,
+            "name": appointment.user.full_name,
             "phone": appointment.user.phone,
             "age": appointment.user.age,
             "gender": appointment.user.gender
@@ -957,6 +976,7 @@ async def get_appointment_details(
 @router.post("/cancel", response_model=dict)
 async def cancel_appointment(
     request: CancellationRequest,
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
@@ -975,7 +995,7 @@ async def cancel_appointment(
         raise HTTPException(status_code=404, detail="Appointment not found")
     
     # Verify user owns this appointment
-    if appointment.user_id != request.user_id:
+    if appointment.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not authorized to cancel this appointment")
     
     # Check if already cancelled
@@ -1025,7 +1045,7 @@ async def cancel_appointment(
         # Send notification
         send_notification(
             db=db,
-            user_id=request.user_id,
+            user_id=current_user.id,
             type="appointment_cancelled",
             title="Appointment Cancelled",
             message=f"Your appointment with Dr. {appointment.doctor.name} on {appointment.date} at {appointment.time.strftime('%I:%M %p')} has been cancelled."
@@ -1034,7 +1054,7 @@ async def cancel_appointment(
         # Log action
         log_action(
             db=db,
-            user_id=request.user_id,
+            user_id=current_user.id,
             action="APPOINTMENT_CANCELLED",
             entity_type="appointment",
             entity_id=request.appointment_id,
@@ -1062,7 +1082,7 @@ async def reschedule_appointment(
     appointment_id: str,
     new_slot_id: int,
     new_date: date,
-    user_id: int,
+   current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
@@ -1078,7 +1098,7 @@ async def reschedule_appointment(
         raise HTTPException(status_code=404, detail="Appointment not found")
     
     # Verify user owns this appointment
-    if appointment.user_id != user_id:
+    if appointment.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     # Check if new slot is available
@@ -1115,7 +1135,7 @@ async def reschedule_appointment(
         # Send notification
         send_notification(
             db=db,
-            user_id=user_id,
+            user_id=current_user.id,
             type="appointment_rescheduled",
             title="Appointment Rescheduled",
             message=f"Your appointment has been rescheduled to {new_date} at {new_slot.start_time.strftime('%I:%M %p')}"
@@ -1124,7 +1144,7 @@ async def reschedule_appointment(
         # Log action
         log_action(
             db=db,
-            user_id=user_id,
+            user_id=current_user.id,
             action="APPOINTMENT_RESCHEDULED",
             entity_type="appointment",
             entity_id=appointment_id,
@@ -1148,17 +1168,17 @@ async def reschedule_appointment(
         raise HTTPException(status_code=500, detail=f"Rescheduling failed: {str(e)}")
 
 
-@router.get("/stats/user/{user_id}", response_model=dict)
+@router.get("/stats", response_model=dict)
 async def get_user_appointment_stats(
-    user_id: int,
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
-    Get statistics about user's appointments
-    
-    Useful for dashboard/profile page
+    Get statistics about current user's appointments
     """
     
+    user_id = current_user.id  # ✅ secure
+
     total = db.query(Appointment).filter(Appointment.user_id == user_id).count()
     
     upcoming = db.query(Appointment).filter(
