@@ -845,26 +845,24 @@ async def book_appointment(
             detail=f"Booking failed. Please try again. Error: {str(e)}"
         )
 
-@router.get("/user/{user_id}", response_model=dict)
+@router.get("/user/me", response_model=dict)
 async def get_user_appointments(
-    user_id: int,
     current_user: User = Depends(get_current_user),
     status: Optional[str] = Query(None),
     upcoming_only: bool = Query(False),
     db: Session = Depends(get_db)
 ):
     """
-    Get all appointments for a user
+    Get all appointments for current user
     
     ✅ FIX APPLIED: Added joinedload to prevent N+1 queries
     
     Used for "My Appointments" section
     """
     
-    # Verify user exists
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    user_id = current_user.id
+    
+    # ✅ USER IS ALREADY AUTHENTICATED - NO NEED TO VERIFY AGAIN
     
     # ✅ FIX 10: JOINEDLOAD TO PREVENT N+1 WHEN ACCESSING apt.doctor.name
     # WHY: Without this, accessing apt.doctor.name causes separate query for each appointment

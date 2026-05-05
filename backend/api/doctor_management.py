@@ -305,8 +305,8 @@ async def register_doctor(
             name=request.clinic_name,
             address=request.clinic_address,
             phone=request.clinic_phone or None,
-            location_lat=request.location_lat,
-            location_lng=request.location_lng,
+            location_lat=request.location_lat or 0.0,
+            location_lng=request.location_lng or 0.0,
             emergency_available=request.emergency_available,
             insurance_accepted=request.accepts_insurance,
             working_hours={

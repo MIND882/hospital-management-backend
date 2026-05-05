@@ -1,32 +1,22 @@
 fastapi==0.128.0
-uvicorn[standard]==0.39.0
+uvicorn==0.30.6
 python-dotenv==1.2.1
 SQLAlchemy==2.0.45
 psycopg2-binary==2.9.10
 alembic==1.16.1
 pydantic[email]==2.11.4
 
-# Auth
 PyJWT==2.10.1
 bcrypt==4.3.0
 python-multipart==0.0.20
 
-# Payments
 razorpay==1.4.2
-
-# Notifications
 twilio==9.9.0
 
-# QR codes
 qrcode[pil]==8.1
-
-# File handling
 Pillow==10.2.0
+
 python-magic==0.4.27
-python-magic-bin==0.4.14; sys_platform == "win32"
 
-# HTTP client (emergency geocoding)
 httpx==0.28.1
-
-# Misc
 requests==2.32.5
