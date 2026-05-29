@@ -5,12 +5,17 @@ backend_dir = Path(__file__).parent.parent
 if str(backend_dir) not in sys.path:
     sys.path.insert(0, str(backend_dir))
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session, joinedload, relationship
 from sqlalchemy import and_, func, Column, String, Integer, Float, Boolean, DateTime, Text, ForeignKey
 from database.connection import get_db
 from database.models import User, Clinic, EmergencyRequest, Notification, AuditLog
+from tasks.emergency_tasks import (
+    dispatch_emergency_alert,
+    notify_emergency_contacts_task
+)
 from pydantic import BaseModel, Field, validator
+
 from typing import Optional, List
 from datetime import datetime
 from enum import Enum
@@ -295,7 +300,6 @@ async def alert_nearest_clinic(clinic: Clinic, emergency: EmergencyRequest, user
 @router.post("/request", response_model=EmergencyResponseModel)
 async def create_emergency_request(
     request: EmergencyRequestModel,
-    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
     """
@@ -361,8 +365,7 @@ async def create_emergency_request(
         db.refresh(emergency)
 
         # Send notification
-        send_emergency_notification(
-            db=db,
+        dispatch_emergency_alert.delay(
             user_id=request.user_id,
             emergency_id=emergency_id,
             message=f"Emergency services dispatched! Ambulance ETA: {eta_minutes} mins. Stay calm, help is on the way."
@@ -384,8 +387,13 @@ async def create_emergency_request(
         )
 
         # Background tasks
-        background_tasks.add_task(notify_emergency_contacts, user, emergency_id, address)
-        background_tasks.add_task(alert_nearest_clinic, nearest_clinic, emergency, user)
+        # Celery tasks — persistent, retryable, not in-process
+        notify_emergency_contacts_task.delay(
+            user_id=request.user_id,
+            emergency_id=emergency_id,
+            location=address
+        )
+        # alert_nearest_clinic — TODO: implement as Celery task next phase
 
         # Build ambulance info
         ambulance_info = None

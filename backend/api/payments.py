@@ -5,7 +5,8 @@ backend_dir = Path(__file__).parent.parent
 if str(backend_dir) not in sys.path:
     sys.path.insert(0, str(backend_dir))
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, logger
+from utils.webhook_manager import is_webhook_already_processed, mark_webhook_processed
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import and_
 import razorpay
@@ -725,15 +726,21 @@ async def razorpay_webhook(
     ).hexdigest()
     
     if not hmac.compare_digest(expected_signature, signature):
-        print("❌ Invalid webhook signature")
+        logger.error("❌ Invalid webhook signature")
         raise HTTPException(status_code=400, detail="Invalid signature")
     
-    # Parse webhook data
+     # Parse webhook data
     data = json.loads(body.decode())
     event = data.get("event")
     payload = data.get("payload", {}).get("payment", {}).get("entity", {})
+    payment_id = payload.get("id", "unknown")
     
-    print(f"📨 Razorpay Webhook: {event} - Payment ID: {payload.get('id')}")
+    logger.info(f"Razorpay Webhook: {event} - Payment ID: {payment_id}")
+    
+    # Idempotency check — prevent double processing
+    if is_webhook_already_processed(payment_id, event):
+        logger.warning(f"Duplicate webhook ignored: {payment_id}:{event}")
+        return {"status": "already_processed"}
     
     if event == "payment.captured":
         order_id = payload.get("order_id")
@@ -787,7 +794,9 @@ async def razorpay_webhook(
                     db.add(qr_record)
             
             db.commit()
-            print(f"✅ Payment processed successfully: {payment.razorpay_payment_id}")
+            # Mark as processed AFTER successful commit
+            mark_webhook_processed(payment_id, event)
+            logger.info(f"Payment processed successfully: {payment.razorpay_payment_id}")
     
     elif event == "payment.failed":
         order_id = payload.get("order_id")
@@ -798,7 +807,9 @@ async def razorpay_webhook(
         if payment:
             payment.payment_status = PaymentStatus.FAILED
             db.commit()
-            print(f"❌ Payment failed: {order_id}")
+            # Mark as processed AFTER successful commit
+            mark_webhook_processed(payment_id, event)
+            logger.error(f"❌ Payment failed: {order_id}")
     
     return {"status": "success"}
 

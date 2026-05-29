@@ -4,6 +4,8 @@ from pathlib import Path
 
 from urllib3 import request
 
+from tasks.notification_tasks import send_otp_sms_task
+
 # Add backend directory to path for imports to work when running directly
 backend_dir = Path(__file__).parent.parent
 if str(backend_dir) not in sys.path:
@@ -18,11 +20,24 @@ from database.models import User, AuditLog
 from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import datetime, timedelta
+from utils.rate_limiter import (
+    check_otp_rate_limit, 
+    check_login_rate_limit,
+    record_failed_login,
+    clear_login_attempts
+)
+from utils.token_manager import (
+    blacklist_token,
+    is_token_blacklisted,
+    store_refresh_token,
+    is_refresh_token_valid,
+    revoke_refresh_token,
+    revoke_all_user_tokens
+)
 import os
 from dotenv import load_dotenv
 from twilio.rest import Client
 from twilio.base.exceptions import TwilioRestException
-import asyncio
 import jwt
 import secrets
 import bcrypt
@@ -197,11 +212,15 @@ async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: Session = Depends(get_db)
 ) -> User:
-    """
-    Dependency to get current authenticated user
-    Use this in protected routes: current_user: User = Depends(get_current_user)
-    """
     token = credentials.credentials
+    
+    # Check blacklist first — fast Redis lookup
+    if is_token_blacklisted(token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has been revoked. Please login again."
+        )
+    
     payload = decode_token(token)
     
     if payload.get("type") != "access":
@@ -243,11 +262,8 @@ async def send_otp(
         )
     
     # Rate limiting
-    if not check_rate_limit(request.phone, db):
-        raise HTTPException(
-            status_code=429,
-            detail="Too many OTP requests. Try again in 1 hour."
-        )
+    # Rate limiting via Redis
+    check_otp_rate_limit(request.phone)
     
     # Generate OTP
     otp = generate_otp()
@@ -276,11 +292,10 @@ async def send_otp(
     db.commit()
     db.refresh(user)
     # 🔥 PRODUCTION: Send SMS + WhatsApp (Parallel)
-    sms_task = asyncio.create_task(send_otp_sms(request.phone, otp))
-    whatsapp_task = asyncio.create_task(send_otp_whatsapp(request.phone, otp))
-    
-    sms_success, whatsapp_success = await asyncio.gather(sms_task, whatsapp_task)
-    
+    # Celery tasks — non-blocking, retryable, persistent
+    send_otp_sms_task.delay(phone=request.phone, otp=otp)
+    sms_success = True   # Task queued successfully
+    whatsapp_success = False  # TODO: add whatsapp task in next phase
     # Audit log
     audit = AuditLog(
         user_id=user.id,
@@ -345,6 +360,10 @@ async def verify_otp_endpoint(
             detail="Invalid OTP. Please try again."
         )
     
+    
+    # Clear any rate limit blocks on successful verification
+    clear_login_attempts(request.phone)
+
     # Mark user as verified
     user.is_verified = True
     user.otp = None  # Clear OTP after successful verification
@@ -362,6 +381,13 @@ async def verify_otp_endpoint(
     refresh_token = create_refresh_token(data={
         "user_id": user.id
     })
+    
+    # Store refresh token in Redis for server-side revocation
+    store_refresh_token(
+        user_id=user.id,
+        refresh_token=refresh_token,
+        expires_days=REFRESH_TOKEN_EXPIRE_DAYS
+    )
     
     # Log action
     audit = AuditLog(
@@ -456,13 +482,6 @@ async def refresh_access_token(
     request: RefreshTokenRequest,
     db: Session = Depends(get_db)
 ):
-    """
-    🔄 Refresh Access Token
-    
-    - Validates refresh token
-    - Returns new access token
-    """
-    
     payload = decode_token(request.refresh_token)
     
     if payload.get("type") != "refresh":
@@ -472,38 +491,64 @@ async def refresh_access_token(
         )
     
     user_id = payload.get("user_id")
-    user = db.query(User).filter(User.id == user_id).first()
     
+    # Validate refresh token against Redis stored value
+    # This prevents reuse of old refresh tokens
+    if not is_refresh_token_valid(user_id, request.refresh_token):
+        raise HTTPException(
+            status_code=401,
+            detail="Refresh token is invalid or has been revoked. Please login again."
+        )
+    
+    user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(
             status_code=404,
             detail="User not found"
         )
     
-    # Generate new access token
+    # Generate new tokens — rotation on every refresh
     new_access_token = create_access_token(data={
         "user_id": user.id,
         "phone": user.phone,
         "role": "patient"
     })
     
+    new_refresh_token = create_refresh_token(data={
+        "user_id": user.id
+    })
+    
+    # Rotate refresh token — old one is now invalid
+    store_refresh_token(
+        user_id=user.id,
+        refresh_token=new_refresh_token,
+        expires_days=REFRESH_TOKEN_EXPIRE_DAYS
+    )
+    
     return {
         "access_token": new_access_token,
+        "refresh_token": new_refresh_token,  # New rotated token
         "token_type": "bearer"
     }
 
 
 @router.post("/logout", response_model=dict)
 async def logout(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    🚪 Logout
+    token = credentials.credentials
     
-    - Logs the action
-    - Client should delete tokens
-    """
+    # Blacklist current access token
+    # ACCESS_TOKEN_EXPIRE_MINUTES * 60 = seconds until it would have expired
+    blacklist_token(
+        token=token,
+        expires_in_seconds=ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    )
+    
+    # Revoke refresh token
+    revoke_refresh_token(user_id=current_user.id)
     
     # Log action
     audit = AuditLog(
@@ -518,7 +563,7 @@ async def logout(
     
     return {
         "status": "success",
-        "message": "Logged out successfully"
+        "message": "Logged out successfully. All sessions terminated."
     }
 
 

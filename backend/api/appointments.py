@@ -12,6 +12,8 @@ from sqlalchemy import and_, or_, func
 from database.connection import get_db
 from database.models import User, Doctor, Clinic, DoctorSlot, Appointment, Notification, AuditLog, PaymentStatus, AppointmentPayment, DoctorWallet, WalletTransaction, QRCode
 from api.auth import get_current_user
+from tasks.notification_tasks import send_notification_task
+from tasks.payment_tasks import send_payment_confirmation
 from pydantic import BaseModel, Field
 from api.payments import RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET
 from typing import List, Optional
@@ -216,34 +218,44 @@ def update_doctor_next_available_slot(db: Session, doctor_id: int):
             doctor.next_available_slot = None
         db.commit()
 
-def send_booking_notifications(db: Session, appointment_id: str, doctor_name: str, patient_name: str, payment_method: str):
-    """Background task to notify patient and doctor after booking"""
+def send_booking_notifications(
+    db: Session,
+    appointment_id: str,
+    doctor_name: str,
+    patient_name: str,
+    payment_method: str
+):
+    """
+    Trigger Celery tasks for booking notifications
+    No longer in-process — persistent and retryable
+    """
     try:
         apt = db.query(Appointment).filter(Appointment.id == appointment_id).first()
         if not apt:
             return
-        # Notify patient
-        send_notification(
-            db=db,
+
+        # Notify patient via Celery
+        send_notification_task.delay(
             user_id=apt.user_id,
-            type="appointment_booked",
             title="Appointment Booked",
-            message=f"Your appointment with Dr. {doctor_name} on {apt.date} at {apt.time.strftime('%I:%M %p')} is {apt.status}."
+            message=f"Your appointment with Dr. {doctor_name} on {apt.date} at {apt.time.strftime('%I:%M %p')} is confirmed.",
+            notification_type="appointment_booked"
         )
-        # Notify doctor (via doctor's user account)
+
+        # Notify doctor via Celery
         doc = db.query(Doctor).filter(Doctor.id == apt.doctor_id).first()
         if doc:
-            send_notification(
-                db=db,
+            send_notification_task.delay(
                 user_id=doc.user_id,
-                type="new_appointment",
                 title="New Appointment",
-                message=f"You have a new appointment with {patient_name} on {apt.date} at {apt.time.strftime('%I:%M %p')}."
+                message=f"New appointment with {patient_name} on {apt.date} at {apt.time.strftime('%I:%M %p')}.",
+                notification_type="new_appointment"
             )
-    except Exception:
-        # log silently — avoid raising in background task
-        pass
 
+    except Exception as e:
+        # Log but never raise — booking already succeeded
+        import logging
+        logging.getLogger(__name__).error(f"Booking notification trigger failed: {e}")
 
 def send_notification(
     db: Session,
@@ -553,9 +565,29 @@ async def book_appointment(
         )
     
     # ========== VALIDATION 3: SLOT EXISTS & AVAILABLE ==========
-    slot = db.query(DoctorSlot).with_for_update().filter(
+# with_for_update() locks the row until transaction completes
+# This prevents double booking race condition
+    try:
+       slot = db.query(DoctorSlot).with_for_update(nowait=True).filter(
         DoctorSlot.id == request.slot_id
     ).first()
+    except Exception:
+        raise HTTPException(
+        status_code=409,
+        detail="Slot is being booked by someone else. Please try again."
+    )
+
+    if not slot:
+        raise HTTPException(
+        status_code=404,
+        detail="Time slot not found"
+    )
+
+    if slot.is_booked:
+        raise HTTPException(
+        status_code=400,
+        detail="This time slot is already booked. Please choose another slot."
+    )
     
     if not slot:
         raise HTTPException(

@@ -1,0 +1,146 @@
+version: '3.9'
+
+services:
+     # =================API=================
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: medicare_api
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
+    environment:
+      - DB_HOST=postgres
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - uploads_data:/app/uploads
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    restart: unless-stopped
+    networks:
+      - medicare_network
+ #=====================CELERY WOKRER=================
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: medicare_celery
+    env_file:
+      - ./backend/.env
+    environment:
+      - DB_HOST=postgres
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+    depends_on:
+      - api
+      - redis
+      - postgres
+    volumes:
+      - ./backend:/app
+    command: celery -A celery_app worker --loglevel=info --queues=default,notifications,emergency
+    restart: unless-stopped
+    networks:
+      - medicare_network
+
+  # ==================== CELERY BEAT (scheduled tasks) ====================
+  celery_beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: medicare_celery_beat
+    env_file:
+      - ./backend/.env
+    environment:
+      - DB_HOST=postgres
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+    depends_on:
+      - celery_worker
+      - redis
+    volumes:
+      - ./backend:/app
+    command: celery -A celery_app beat --loglevel=info
+    restart: unless-stopped
+    networks:
+      - medicare_network
+
+  # ==================== POSTGRES ====================
+  postgres:
+    image: postgres:15-alpine
+    container_name: medicare_postgres
+    environment:
+      POSTGRES_USER: medicare_admin
+      POSTGRES_PASSWORD: "CHAUHAN@55@123"
+      POSTGRES_DB: medicare_v2
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-medicare_admin} -d ${DB_NAME:-medicare_v2}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - medicare_network
+
+  # ==================== REDIS ====================
+  redis:
+    image: redis:7-alpine
+    container_name: medicare_redis
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - medicare_network
+
+  # ==================== FLOWER (Celery Monitor) ====================
+  flower:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: medicare_flower
+    ports:
+      - "5555:5555"
+    env_file:
+      - ./backend/.env
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+    depends_on:
+      - redis
+      - celery_worker
+    command: celery -A celery_app flower --port=5555
+    restart: unless-stopped
+    networks:
+      - medicare_network
+
+# ==================== VOLUMES ====================
+volumes:
+  postgres_data:
+  redis_data:
+  uploads_data:
+
+# ==================== NETWORKS ====================
+networks:
+  medicare_network:
+    driver: bridge
