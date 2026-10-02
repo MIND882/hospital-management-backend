@@ -1,1187 +1,543 @@
-import sys
-from pathlib import Path
+"""
+api/doctor_management.py — SECURITY-HARDENED - FINAL PRODUCTION
+Install: pip install "passlib[bcrypt]"
 
-from requests import request
+DB Migrations to run first:
+CREATE UNIQUE INDEX IF NOT EXISTS uq_doctor_slot_start ON doctor_slots (doctor_id, date, start_time);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_wallet_credit_per_appointment ON wallet_transactions (appointment_id, transaction_type) WHERE transaction_type = 'credit';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_doctor_medical_license ON doctors (medical_license_number);
+ALTER TABLE wallet_transactions ADD COLUMN IF NOT EXISTS appointment_id VARCHAR(64);
+"""
 
-# Add backend directory to path for imports to work when running directly
-backend_dir = Path(__file__).parent.parent
-if str(backend_dir) not in sys.path:
-    sys.path.insert(0, str(backend_dir))
+import logging
+import uuid
+from datetime import date, datetime, time, timedelta
+from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
-from sqlalchemy.orm import Session, joinedload
+from fastapi import APIRouter, Depends, HTTPException, Query
+from passlib.context import CryptContext
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 from sqlalchemy import and_, func, desc, extract
+from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
+from sqlalchemy.orm import Session, joinedload
+
 from database.connection import get_db
 from database.models import (
-    User, Doctor, Clinic, DoctorSlot, Appointment, 
+    User, Doctor, Clinic, DoctorSlot, Appointment,
     DoctorWallet, WalletTransaction, AuditLog, Notification
 )
-from api.auth import get_current_user
-from pydantic import BaseModel, Field, EmailStr,model_validator
-from typing import List, Optional
-from datetime import datetime, date, time, timedelta
-import secrets
-import hashlib
-import hmac
-from api.auth import create_access_token
+from api.auth import get_current_user, create_access_token
+
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/doctor", tags=["Doctor Management"])
+
+# ==================== SECURITY HELPERS ====================
+
+password_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+PASSWORD_MAX_LENGTH = 72
+
+def hash_password(password: str) -> str:
+    if len(password.encode("utf-8")) > PASSWORD_MAX_LENGTH:
+        raise ValueError("Password is too long")
+    return password_context.hash(password)
+
+def verify_password(plain_password: str, stored_hash: str) -> bool:
+    try:
+        if len(plain_password.encode("utf-8")) > PASSWORD_MAX_LENGTH:
+            return False
+        return password_context.verify(plain_password, stored_hash)
+    except Exception:
+        return False
+
+def generate_clinic_id() -> str:
+    return f"CLI_{uuid.uuid4().hex[:16]}"
+
+def mask_phone(phone: Optional[str]) -> Optional[str]:
+    if not phone:
+        return None
+    phone = str(phone)
+    if len(phone) <= 4:
+        return "****"
+    return f"{'*' * (len(phone) - 4)}{phone[-4:]}"
+
+def get_verified_doctor(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Doctor:
+    if current_user.role!= "doctor":
+        raise HTTPException(status_code=403, detail="Doctor access required")
+    if not current_user.is_active:
+        raise HTTPException(status_code=403, detail="Account is inactive")
+    doctor = db.query(Doctor).filter(Doctor.user_id == current_user.id).first()
+    if not doctor:
+        raise HTTPException(status_code=404, detail="Doctor profile not found")
+    if not doctor.is_verified:
+        raise HTTPException(status_code=403, detail="Doctor verification is pending")
+    return doctor
+
+def send_notification(db: Session, user_id: int, title: str, message: str, notification_type: str = "general", related_entity_type: Optional[str] = None, related_entity_id: Optional[str] = None) -> None:
+    db.add(Notification(
+        user_id=user_id, title=title, message=message,
+        notification_type=notification_type, is_read=False,
+        related_entity_type=related_entity_type, related_entity_id=related_entity_id,
+        created_at=datetime.now()
+    ))
 
 # ==================== PYDANTIC MODELS ====================
 
+VALID_WEEKDAYS = {"monday","tuesday","wednesday","thursday","friday","saturday","sunday"}
+
+class TimeSlotInput(BaseModel):
+    start: time
+    end: time
+    @model_validator(mode='after')
+    def validate_slot_range(self):
+        if self.end <= self.start:
+            raise ValueError("Slot end time must be after start time")
+        duration_minutes = (datetime.combine(date.today(), self.end) - datetime.combine(date.today(), self.start)).seconds // 60
+        if duration_minutes < 10:
+            raise ValueError("Slot duration must be at least 10 minutes")
+        if duration_minutes > 180:
+            raise ValueError("Slot duration cannot exceed 3 hours")
+        return self
+
 class DoctorRegistrationRequest(BaseModel):
-    """Doctor onboarding form"""
-    clinic_id: Optional[str] = None  # If joining existing clinic
-    clinic_name: Optional[str] = None  # If creating new clinic
-    clinic_address: Optional[str] = None
-    clinic_phone: Optional[str] = None
-    location_lat: Optional[float] = None
-    location_lng: Optional[float] = None
-    
-    # Doctor details
-    full_name:str =Field(..., min_length=2, max_length=100)
-    email: EmailStr = Field(..., description="Doctor's official email for login")
-    password: str = Field(..., min_length=8, description="Set a strong password for login")
-    specialties: List[str] = Field(..., min_length=1, description="List of specialties")
-    qualification: str = Field(..., min_length=2)
+    clinic_name: str = Field(..., min_length=2, max_length=100)
+    clinic_address: str = Field(..., min_length=5, max_length=255)
+    clinic_phone: Optional[str] = Field(None, max_length=20)
+    location_lat: float = Field(..., ge=-90, le=90)
+    location_lng: float = Field(..., ge=-180, le=180)
+    full_name: str = Field(..., min_length=2, max_length=100)
+    email: EmailStr
+    password: str = Field(..., min_length=8, max_length=72)
+    specialties: List[str] = Field(..., min_length=1, max_length=5)
+    qualification: str = Field(..., min_length=2, max_length=100)
     experience_years: int = Field(..., ge=0, le=70)
     consultation_fee: int = Field(..., ge=100, le=10000)
-    
-    # Registration documents
-    medical_license_number: str
-    medical_council: str = Field(default="Medical Council of India")
-    
-    # Working hours
-    working_days: List[str] 
-    working_hours_start: str 
-    working_hours_end: str 
-
-    
-    # Services
+    medical_license_number: str = Field(..., min_length=5, max_length=50)
+    medical_council: str = Field(default="Medical Council of India", max_length=100)
+    working_days: List[str] = Field(..., min_length=1, max_length=7)
+    working_hours_start: str = Field(..., pattern=r"^\d{2}:\d{2}$")
+    working_hours_end: str = Field(..., pattern=r"^\d{2}:\d{2}$")
     emergency_available: bool = False
-    accepts_insurance: List[str] = []
-class DoctorLoginRequest(BaseModel):
-    """Doctor Login Form - Use email OR phone"""
-    email: Optional[EmailStr] = Field(None, example="dr.smith@clinic.com")
-    phone: Optional[str] = Field(None, min_length=10, max_length=15, example="9876543210")
-    password: str = Field(..., min_length=8)
+    accepts_insurance: List[str] = Field(default_factory=list, max_length=20)
 
-    # Validation logic: Dono mein se ek cheez toh honi hi chahiye
+    @field_validator("working_days")
+    @classmethod
+    def validate_days(cls, days: List[str]) -> List[str]:
+        cleaned = list({d.strip().lower() for d in days})
+        invalid = set(cleaned) - VALID_WEEKDAYS
+        if invalid:
+            raise ValueError(f"Invalid working days: {', '.join(invalid)}")
+        return cleaned
+
+class DoctorLoginRequest(BaseModel):
+    email: Optional[EmailStr] = None
+    phone: Optional[str] = Field(None, min_length=10, max_length=15)
+    password: str = Field(..., min_length=8)
     @model_validator(mode='after')
     def check_identifier(self):
         if not self.email and not self.phone:
-            raise ValueError('Email ya Phone number, mein se ek dena compulsory hai')
+            raise ValueError('Email or Phone is required')
         return self
 
-    class Config:
-        str_strip_whitespace = True
-
 class CreateSlotBatchRequest(BaseModel):
-    """Bulk slot creation"""
     start_date: date
     end_date: date
-    time_slots: List[dict] = Field(
-        ..., 
-        description="[{'start': '09:00', 'end': '09:30'}, ...]"
-    )
-    days: List[str] = Field(..., description="['monday', 'tuesday', ...]")
-    skip_dates: Optional[List[date]] = []  # Holidays/leave
+    time_slots: List[TimeSlotInput] = Field(..., min_length=1, max_length=50)
+    days: List[str] = Field(..., min_length=1, max_length=7)
+    skip_dates: List[date] = Field(default_factory=list, max_length=90)
+
+    @field_validator("days")
+    @classmethod
+    def validate_days(cls, days: List[str]) -> List[str]:
+        cleaned = list({d.strip().lower() for d in days})
+        invalid = set(cleaned) - VALID_WEEKDAYS
+        if invalid:
+            raise ValueError(f"Invalid days: {', '.join(invalid)}")
+        return cleaned
+
+    @model_validator(mode='after')
+    def validate_date_range(self):
+        today = date.today()
+        if self.start_date < today:
+            raise ValueError("Cannot create slots in the past")
+        if self.end_date < self.start_date:
+            raise ValueError("end_date must be after start_date")
+        if (self.end_date - self.start_date).days > 90:
+            raise ValueError("Slot creation limited to 90 days per request")
+        if ((self.end_date - self.start_date).days + 1) * len(self.time_slots) > 500:
+            raise ValueError("Maximum 500 slots per request")
+        return self
 
 class UpdateSlotRequest(BaseModel):
     slot_id: int
     is_blocked: Optional[bool] = None
-    reason: Optional[str] = None
+    reason: Optional[str] = Field(None, max_length=255)
 
 class UpdateDoctorProfileRequest(BaseModel):
-    consultation_fee: Optional[int] = None
-    specialties: Optional[List[str]] = None
-    bio: Optional[str] = None
+    consultation_fee: Optional[int] = Field(None, ge=100, le=50000)
+    specialties: Optional[List[str]] = Field(None, max_length=5)
+    bio: Optional[str] = Field(None, max_length=1000)
     is_available: Optional[bool] = None
 
 class LeaveRequest(BaseModel):
     start_date: date
     end_date: date
-    reason: str
+    reason: str = Field(..., min_length=3, max_length=500)
+    @model_validator(mode='after')
+    def validate_leave_dates(self):
+        if self.start_date < date.today():
+            raise ValueError("Leave cannot start in the past")
+        if self.end_date < self.start_date:
+            raise ValueError("end_date must be after start_date")
+        if (self.end_date - self.start_date).days > 90:
+            raise ValueError("Leave range cannot exceed 90 days")
+        return self
 
 class WithdrawRequest(BaseModel):
-    amount: int = Field(..., ge=100)
-    bank_account: str
-    ifsc_code: str
+    amount: int = Field(..., ge=500, le=500000)
+    bank_account: str = Field(..., min_length=8, max_length=34)
+    ifsc_code: str = Field(..., min_length=11, max_length=11)
 
-# ==================== HELPER FUNCTIONS ====================
+    @field_validator("bank_account")
+    @classmethod
+    def validate_bank_account(cls, v: str) -> str:
+        v = v.strip().replace(" ", "")
+        if not v.isalnum():
+            raise ValueError("Invalid bank account number")
+        return v
 
-def hash_password(password: str) -> str:
-    """
-    Plain password ko salted SHA-256 hash mein convert karta hai.
-    Format: salt$hash  (salt alag rakhte hain taaki verify mein use kar sakein)
-    """
-    salt = secrets.token_hex(16)                          # 16 bytes = 32 char random salt
-    hashed = hashlib.sha256((salt + password).encode()).hexdigest()
-    return f"{salt}${hashed}"                             # "salt$hash" format mein store karo
+    @field_validator("ifsc_code")
+    @classmethod
+    def validate_ifsc(cls, v: str) -> str:
+        v = v.strip().upper()
+        if len(v)!= 11 or not v[:4].isalpha() or v[4]!= "0" or not v[5:].isalnum():
+            raise ValueError("Invalid IFSC code")
+        return v
 
+# ==================== CORE LOGIC ====================
 
-def verify_password(plain_password: str, stored_hash: str) -> bool:
-    """
-    Login pe plain password ko stored hash se compare karta hai.
-    Stored hash ka format: salt$hash
-    """
-    try:
-        salt, hashed = stored_hash.split("$")            # salt aur hash alag karo
-        computed = hashlib.sha256((salt + plain_password).encode()).hexdigest()
-        return hmac.compare_digest(computed, hashed)     # timing-safe comparison
-    except ValueError:
-        return False                                     # format wrong ho toh False
-
-
-def generate_clinic_id() -> str:
-    """Generate unique clinic ID"""
-    return f"CLI{secrets.randbelow(900) + 100:03d}"
-
-
-def generate_token() -> str:
-    """
-    Login ke baad ek unique session/auth token generate karta hai.
-    secrets.token_urlsafe gives a cryptographically strong random token.
-    """
-    return secrets.token_urlsafe(32)                     # 32 bytes = ~43 char URL-safe token
-
-
-def send_notification(
-    db: Session,
-    user_id: int,
-    title: str,
-    message: str,
-    notification_type: str = "general",
-    related_entity_type: Optional[str] = None,
-    related_entity_id: Optional[str] = None
-) -> None:
-    """
-    📣 Notification create karta hai kisi bhi user ke liye.
-    Har jagah pe reuse karo — registration, leave, appointment complete, withdrawal, etc.
-
-    Args:
-        db: Database session
-        user_id: Notification kis user ko milegi uska ID
-        title: Notification ka title
-        message: Notification ka body/message
-        notification_type: "general" | "appointment" | "wallet" | "leave" | "verification"
-        related_entity_type: Optional — jaise "appointment", "withdrawal", "doctor"
-        related_entity_id: Optional — related entity ka ID (str mein)
-    """
-    notification = Notification(
-        user_id=user_id,
-        title=title,
-        message=message,
-        notification_type=notification_type,
-        is_read=False,
-        related_entity_type=related_entity_type,
-        related_entity_id=related_entity_id,
-        created_at=datetime.now()
-    )
-    db.add(notification)
-    # Note: db.commit() caller pe hai — yahan sirf add karte hain
-
-
-def create_time_slots(
-    doctor_id: int,
-    start_date: date,
-    end_date: date,
-    time_slots: List[dict],
-    days: List[str],
-    skip_dates: List[date],
-    db: Session
-) -> int:
-    """
-    Bulk create time slots for doctor
-    Returns: Number of slots created
-    """
-    slots_created = 0
-    current_date = start_date
-    
-    day_map = {
-        'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3,
-        'friday': 4, 'saturday': 5, 'sunday': 6
-    }
-
-    while current_date <= end_date:
-        # Check if this day should have slots
-        day_name = current_date.strftime('%A').lower()
-        
-        if day_name in days and current_date not in skip_dates:
-            # Create slots for this day
+def create_time_slots(doctor_id: int, start_date: date, end_date: date, time_slots: List[TimeSlotInput], days: List[str], skip_dates: List[date], db: Session) -> int:
+    existing = db.query(DoctorSlot.date, DoctorSlot.start_time).filter(DoctorSlot.doctor_id == doctor_id, DoctorSlot.date >= start_date, DoctorSlot.date <= end_date).all()
+    existing_keys = {(d, t) for d, t in existing}
+    allowed_days = set(days)
+    skipped = set(skip_dates)
+    new_slots = []
+    cur = start_date
+    while cur <= end_date:
+        if cur.strftime("%A").lower() in allowed_days and cur not in skipped:
             for slot in time_slots:
-                start_time = datetime.strptime(slot['start'], '%H:%M').time()
-                end_time = datetime.strptime(slot['end'], '%H:%M').time()
-                
-                # Check if slot already exists
-                existing = db.query(DoctorSlot).filter(
-                    and_(
-                        DoctorSlot.doctor_id == doctor_id,
-                        DoctorSlot.date == current_date,
-                        DoctorSlot.start_time == start_time
-                    )
-                ).first()
-                
-                if not existing:
-                    new_slot = DoctorSlot(
-                        doctor_id=doctor_id,
-                        date=current_date,
-                        start_time=start_time,
-                        end_time=end_time,
-                        is_booked=False,
-                        is_blocked=False
-                    )
-                    db.add(new_slot)
-                    slots_created += 1
-        
-        current_date += timedelta(days=1)
-    
-    return slots_created
+                key = (cur, slot.start)
+                if key not in existing_keys:
+                    new_slots.append(DoctorSlot(doctor_id=doctor_id, date=cur, start_time=slot.start, end_time=slot.end, is_booked=False, is_blocked=False))
+                    existing_keys.add(key)
+        cur += timedelta(days=1)
+    if new_slots:
+        db.bulk_save_objects(new_slots)
+    return len(new_slots)
 
+def credit_doctor_wallet_once(db: Session, doctor_id: int, appointment_id: str, amount: int, source: str) -> bool:
+    """Call ONLY from webhook or admin cash confirm. Never from doctor /complete."""
+    if amount <= 0:
+        raise ValueError("Credit amount must be positive")
+    wallet = db.query(DoctorWallet).filter(DoctorWallet.doctor_id == doctor_id).with_for_update().first()
+    if not wallet:
+        raise RuntimeError("Doctor wallet not found")
+    existing = db.query(WalletTransaction).filter(WalletTransaction.appointment_id == appointment_id, WalletTransaction.transaction_type == "credit").first()
+    if existing:
+        return False
+    before = int(wallet.current_balance or 0)
+    db.add(WalletTransaction(wallet_id=wallet.id, appointment_id=appointment_id, amount=amount, transaction_type="credit", description=f"Verified payment credit ({source})", balance_before=before, balance_after=before+amount))
+    wallet.current_balance = before + amount
+    wallet.total_earned = int(wallet.total_earned or 0) + amount
+    wallet.last_updated = datetime.now()
+    return True
 
-# ==================== REGISTRATION & ONBOARDING ====================
+# ==================== ENDPOINTS ====================
 
 @router.post("/register", response_model=dict)
-async def register_doctor(
-    request: DoctorRegistrationRequest,
-    db: Session = Depends(get_db)
-):
-    """
-    📝 DOCTOR REGISTRATION/ONBOARDING
-    
-    Creates:
-    - User account (email + hashed password)
-    - Clinic (if new) or joins existing
-    - Doctor profile
-    - Initial slots (1 month)
-    - Wallet
-    - Welcome notification
-    """
+async def register_doctor(request: DoctorRegistrationRequest, db: Session = Depends(get_db)):
+    try:
+        if db.query(User).filter(User.email == request.email).first():
+            raise HTTPException(status_code=409, detail="An account with this email already exists")
+        if db.query(Doctor).filter(Doctor.medical_license_number == request.medical_license_number.strip()).first():
+            raise HTTPException(status_code=409, detail="Medical license is already registered")
 
-    # --- Step 1: Check if email already registered ---
-    existing_user = db.query(User).filter(User.email == request.email).first()
-    if existing_user:
-        raise HTTPException(
-            status_code=400,
-            detail="Email already registered. Please use a different email or login."
-        )
+        # IMPORTANT: Block clinic takeover - no clinic_id self-join allowed
+        # clinic_id joining must be via invite flow, not self-service
 
-    # --- Step 2: Create User account with hashed password ---
-    hashed_pwd = hash_password(request.password)
-    new_user = User(
-      full_name=request.full_name,
-      email=request.email,
-      phone=f"DR{secrets.randbelow(1000000000)}",
-      password_hash=hashed_pwd,
-      role="doctor",
-      is_active=True,
-      created_at=datetime.now()
-    )
-    db.add(new_user)
-    db.flush()                                           # new_user.id milega
-
-    # --- Step 3: Check if doctor profile already exists (edge case) ---
-    existing_doctor = db.query(Doctor).filter(Doctor.user_id == new_user.id).first()
-    if existing_doctor:
-        raise HTTPException(
-            status_code=400, 
-            detail="Doctor profile already exists"
-        )
-    
-    # --- Step 4: Handle clinic ---
-    clinic_id = request.clinic_id
-    
-    if not clinic_id:
-        # Create new clinic
-        if not all([request.clinic_name, request.clinic_address]):
-            raise HTTPException(
-                status_code=400,
-                detail="Clinic name and address required for new clinic"
-            )
-        
         clinic_id = generate_clinic_id()
-        
+        new_user = User(
+            full_name=request.full_name.strip(),
+            email=str(request.email).lower(),
+            phone=None, # Require separate phone verification flow, no fake DRxxx
+            password_hash=hash_password(request.password),
+            role="doctor",
+            is_active=True,
+            created_at=datetime.now()
+        )
+        db.add(new_user)
+        db.flush()
+
         clinic = Clinic(
             id=clinic_id,
-            name=request.clinic_name,
-            address=request.clinic_address,
-            phone=request.clinic_phone or None,
-            location_lat=request.location_lat or 0.0,
-            location_lng=request.location_lng or 0.0,
+            name=request.clinic_name.strip(),
+            address=request.clinic_address.strip(),
+            phone=request.clinic_phone.strip() if request.clinic_phone else None,
+            location_lat=request.location_lat,
+            location_lng=request.location_lng,
             emergency_available=request.emergency_available,
-            insurance_accepted=request.accepts_insurance,
-            working_hours={
-                day: f"{request.working_hours_start}-{request.working_hours_end}"
-                for day in request.working_days
-            }
+            insurance_accepted=request.accepts_insurance or [],
+            working_hours={day: f"{request.working_hours_start}-{request.working_hours_end}" for day in request.working_days}
         )
         db.add(clinic)
-    else:
-        # Verify clinic exists
-        clinic = db.query(Clinic).filter(Clinic.id == clinic_id).first()
-        if not clinic:
-            raise HTTPException(status_code=404, detail="Clinic not found")
-    
-    # --- Step 5: Create doctor profile ---
-    doctor = Doctor(
-        clinic_id=clinic_id,
-        user_id=new_user.id,
-        name=request.full_name,
-        specialties=request.specialties,
-        specialization=request.specialties[0],
-        qualification=request.qualification,
-        experience_years=request.experience_years,
-        consultation_fee=request.consultation_fee,
-        medical_license_number=request.medical_license_number,
-        medical_council=request.medical_council,
-        is_available=True,
-        is_verified=False,                               # Pending admin verification
-        rating=0.0,
-        total_consultations=0
-    )
-    
-    db.add(doctor)
-    db.flush()                                           # Get doctor.id
-    
-    # --- Step 6: Create wallet ---
-    wallet = DoctorWallet(
-        doctor_id=doctor.id,
-        current_balance=0,
-        total_earned=0,
-        total_withdrawn=0
-    )
-    db.add(wallet)
-    
-    # --- Step 7: Create initial slots (next 30 days) ---
-    default_slots = [
-        {'start': '09:00', 'end': '09:30'},
-        {'start': '09:30', 'end': '10:00'},
-        {'start': '10:00', 'end': '10:30'},
-        {'start': '10:30', 'end': '11:00'},
-        {'start': '11:00', 'end': '11:30'},
-        {'start': '11:30', 'end': '12:00'},
-        {'start': '14:00', 'end': '14:30'},
-        {'start': '14:30', 'end': '15:00'},
-        {'start': '15:00', 'end': '15:30'},
-        {'start': '15:30', 'end': '16:00'},
-        {'start': '16:00', 'end': '16:30'},
-        {'start': '16:30', 'end': '17:00'},
-    ]
-    
-    slots_created = create_time_slots(
-        doctor_id=doctor.id,
-        start_date=date.today(),
-        end_date=date.today() + timedelta(days=30),
-        time_slots=default_slots,
-        days=request.working_days,
-        skip_dates=[],
-        db=db
-    )
+        db.flush()
 
-    # --- Step 8: Welcome notification ---
-    send_notification(
-        db=db,
-        user_id=new_user.id,
-        title="Welcome! 🎉",
-        message=(
-            f"Dr. {request.full_name}, aapka registration successful hai. "
-            f"Aapka profile abhi verification pending hai. "
-            f"24-48 ghante mein admin verify karega."
-        ),
-        notification_type="verification",
-        related_entity_type="doctor",
-        related_entity_id=str(doctor.id)
-    )
-    
-    # --- Step 9: Audit log ---
-    audit = AuditLog(
-        user_id=new_user.id,
-        action="DOCTOR_REGISTERED",
-        entity_type="doctor",
-        entity_id=str(doctor.id),
-        details={
-            "clinic_id": clinic_id,
-            "specialties": request.specialties,
-            "slots_created": slots_created
-        }
-    )
-    db.add(audit)
-    db.commit()
-    
-    return {
-        "status": "success",
-        "message": "Doctor registration successful. Pending verification.",
-        "doctor_id": doctor.id,
-        "clinic_id": clinic_id,
-        "slots_created": slots_created,
-        "verification_status": "pending",
-        "next_steps": [
-            "Upload medical license document",
-            "Upload clinic registration certificate",
-            "Wait for admin verification (24-48 hours)",
-            "Once verified, you can start accepting appointments"
-        ]
-    }
+        doctor = Doctor(
+            clinic_id=clinic.id, user_id=new_user.id, name=request.full_name.strip(),
+            specialties=request.specialties, specialization=request.specialties[0],
+            qualification=request.qualification.strip(), experience_years=request.experience_years,
+            consultation_fee=request.consultation_fee,
+            medical_license_number=request.medical_license_number.strip(),
+            medical_council=request.medical_council.strip(),
+            is_available=False, # Not bookable until verified
+            is_verified=False, rating=0.0, total_consultations=0
+        )
+        db.add(doctor)
+        db.flush()
 
-
-
-# ==================== LOGIN ====================
+        db.add(DoctorWallet(doctor_id=doctor.id, current_balance=0, total_earned=0, total_withdrawn=0, pending_withdrawal=0))
+        send_notification(db, new_user.id, "Registration received", "Your doctor profile is pending medical-license verification.", "verification", "doctor", str(doctor.id))
+        db.add(AuditLog(user_id=new_user.id, action="DOCTOR_REGISTERED", entity_type="doctor", entity_id=str(doctor.id), details={"clinic_id": clinic.id, "verification_status": "pending"}))
+        db.commit()
+        return {"status": "success", "message": "Registration submitted. Verification is required.", "doctor_id": doctor.id, "clinic_id": clinic.id, "verification_status": "pending"}
+    except HTTPException:
+        db.rollback()
+        raise
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Registration conflict. Email or license may already exist.")
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Registration failed: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="Registration could not be completed")
 
 @router.post("/login", response_model=dict)
-async def login_doctor(
-    request: DoctorLoginRequest,
-    db: Session = Depends(get_db)
-):
-    """
-    🔐 DOCTOR LOGIN
-    
-    Email ya phone se login karo + password verify karo.
-    Successful login pe token return hota hai + doctor profile info.
-    """
+async def login_doctor(request: DoctorLoginRequest, db: Session = Depends(get_db)):
+    identifier_email = str(request.email).lower() if request.email else None
+    identifier_phone = request.phone.strip() if request.phone else None
+    user_q = db.query(User).filter(User.role == "doctor")
+    user = user_q.filter(User.email == identifier_email).first() if identifier_email else user_q.filter(User.phone == identifier_phone).first()
 
-    # --- Step 1: User dhundho email ya phone se ---
-    if request.email:
-        user = db.query(User).filter(User.email == request.email).first()
-    else:
-        user = db.query(User).filter(User.phone == request.phone).first()
+    if not user or not verify_password(request.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid email/phone or password")
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="Account is inactive")
 
-    if not user:
-        raise HTTPException(
-            status_code=401,
-            detail="Email/Phone number not found. Please register first."
-        )
-
-    # --- Step 2: Password verify karo ---
-    if not verify_password(request.password, user.password_hash):
-        raise HTTPException(
-            status_code=401,
-            detail="Incorrect password. Please try again."
-        )
-
-    # --- Step 3: Doctor profile check karo ---
     doctor = db.query(Doctor).filter(Doctor.user_id == user.id).first()
     if not doctor:
-        raise HTTPException(
-            status_code=404,
-            detail="Doctor profile not found. Please complete registration."
-        )
+        raise HTTPException(status_code=403, detail="Doctor profile is unavailable")
+    if not doctor.is_verified:
+        raise HTTPException(status_code=403, detail="Doctor verification is pending")
 
-    # --- Step 4: Token generate karo aur user pe store karo ---
-    token = create_access_token({
-    "user_id": user.id,
-    "role": "doctor"
-})
+    token = create_access_token({"user_id": user.id, "role": "doctor", "doctor_id": doctor.id})
     user.last_login = datetime.now()
+    db.add(AuditLog(user_id=user.id, action="DOCTOR_LOGGED_IN", entity_type="doctor", entity_id=str(doctor.id), details={"login_via": "email" if identifier_email else "phone"}))
     db.commit()
-
-    # --- Step 5: Audit log ---
-    audit = AuditLog(
-        user_id=user.id,
-        action="DOCTOR_LOGGED_IN",
-        entity_type="doctor",
-        entity_id=str(doctor.id),
-        details={
-            "login_via": "email" if request.email else "phone",
-            "timestamp": str(datetime.now())
-        }
-    )
-    db.add(audit)
-    db.commit()
-
-    return {
-        "status": "success",
-        "message": "Login successful",
-        "token": token,
-        "doctor": {
-            "doctor_id": doctor.id,
-            "user_id": user.id,
-            "name": doctor.name,
-            "clinic_id": doctor.clinic_id,
-            "specialties": doctor.specialties,
-            "is_verified": doctor.is_verified,
-            "is_available": doctor.is_available,
-            "verification_status": "verified" if doctor.is_verified else "pending"
-        }
-    }
-
-
-# ==================== SLOT MANAGEMENT ====================
+    return {"status": "success", "token": token, "doctor": {"doctor_id": doctor.id, "name": doctor.name, "clinic_id": doctor.clinic_id, "specialties": doctor.specialties, "is_verified": True, "is_available": doctor.is_available}}
 
 @router.post("/slots/create-batch", response_model=dict)
-async def create_slots_batch(
-    request: CreateSlotBatchRequest,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """
-    📅 BULK CREATE SLOTS
-    
-    Example: Create next 3 months slots in one go
-    """
-    
-    # Get doctor profile
-    doctor = db.query(Doctor).filter(Doctor.user_id == current_user.id).first()
-    if not doctor:
-        raise HTTPException(status_code=404, detail="Doctor profile not found")
-    
-    # Create slots
-    slots_created = create_time_slots(
-        doctor_id=doctor.id,
-        start_date=request.start_date,
-        end_date=request.end_date,
-        time_slots=request.time_slots,
-        days=request.days,
-        skip_dates=request.skip_dates or [],
-        db=db
-    )
-    
-    db.commit()
-    
-    return {
-        "status": "success",
-        "slots_created": slots_created,
-        "date_range": f"{request.start_date} to {request.end_date}"
-    }
-
+async def create_slots_batch(request: CreateSlotBatchRequest, doctor: Doctor = Depends(get_verified_doctor), db: Session = Depends(get_db)):
+    try:
+        created = create_time_slots(doctor.id, request.start_date, request.end_date, request.time_slots, request.days, request.skip_dates, db)
+        db.add(AuditLog(user_id=doctor.user_id, action="DOCTOR_SLOTS_CREATED", entity_type="doctor", entity_id=str(doctor.id), details={"start_date": request.start_date.isoformat(), "end_date": request.end_date.isoformat(), "slots_created": created}))
+        db.commit()
+        return {"status": "success", "slots_created": created, "date_range": f"{request.start_date.isoformat()} to {request.end_date.isoformat()}"}
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Some slots already exist. Refresh and retry.")
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Slots could not be created")
 
 @router.get("/slots/my-schedule", response_model=dict)
-async def get_my_schedule(
-    current_user: User = Depends(get_current_user),
-    start_date: Optional[date] = None,
-    end_date: Optional[date] = None,
-    db: Session = Depends(get_db)
-):
-    """
-    📆 VIEW MY SCHEDULE
-    
-    Shows all slots with booking status
-    """
-    
-    doctor = db.query(Doctor).filter(Doctor.user_id == current_user.id).first()
-    if not doctor:
-        raise HTTPException(status_code=404, detail="Doctor profile not found")
-    
-    # Default to next 7 days
-    if not start_date:
-        start_date = date.today()
-    if not end_date:
-        end_date = start_date + timedelta(days=7)
-
-    # Get slots
-    slots = db.query(DoctorSlot).filter(
-        and_(
-            DoctorSlot.doctor_id == doctor.id,
-            DoctorSlot.date >= start_date,
-            DoctorSlot.date <= end_date
-        )
-    ).order_by(DoctorSlot.date, DoctorSlot.start_time).all()
-    
-    # Group by date
+async def get_my_schedule(doctor: Doctor = Depends(get_verified_doctor), start_date: Optional[date] = None, end_date: Optional[date] = None, db: Session = Depends(get_db)):
+    start_date = start_date or date.today()
+    end_date = end_date or (start_date + timedelta(days=7))
+    slots = db.query(DoctorSlot).options(joinedload(DoctorSlot.appointment).joinedload(Appointment.user)).filter(DoctorSlot.doctor_id == doctor.id, DoctorSlot.date >= start_date, DoctorSlot.date <= end_date).order_by(DoctorSlot.date, DoctorSlot.start_time).all()
     schedule = {}
     for slot in slots:
-        date_str = str(slot.date)
-        if date_str not in schedule:
-            schedule[date_str] = {
-                "date": date_str,
-                "day": slot.date.strftime('%A'),
-                "slots": []
-            }
-        
-        # Get appointment if booked
-        appointment = None
-        if slot.is_booked:
-            appointment = db.query(Appointment).filter(
-                Appointment.slot_id == slot.id
-            ).first()
-
-        schedule[date_str]["slots"].append({
+        dstr = str(slot.date)
+        if dstr not in schedule:
+            schedule[dstr] = {"date": dstr, "day": slot.date.strftime('%A'), "slots": []}
+        apt = getattr(slot, 'appointment', None)
+        if not apt and slot.is_booked:
+            apt = db.query(Appointment).filter(Appointment.slot_id == slot.id, Appointment.status.in_(["confirmed","reschedule_required"])).first()
+        schedule[dstr]["slots"].append({
             "slot_id": slot.id,
             "time": f"{slot.start_time.strftime('%I:%M %p')} - {slot.end_time.strftime('%I:%M %p')}",
             "status": "blocked" if slot.is_blocked else ("booked" if slot.is_booked else "available"),
-            "patient_name": appointment.user.full_name if appointment else None,
-            "patient_phone": appointment.user.phone if appointment else None,
-            "appointment_id": appointment.id if appointment else None,
-            "reason": appointment.reason if appointment else None
+            "patient_name": apt.user.full_name if apt and apt.user else None,
+            "patient_phone": mask_phone(apt.user.phone) if apt and apt.user else None,
+            "appointment_id": apt.id if apt else None,
+            "reason": apt.reason if apt else None
         })
-    
-    return {
-        "date_range": f"{start_date} to {end_date}",
-        "schedule": list(schedule.values())
-    }
-
+    return {"date_range": f"{start_date} to {end_date}", "schedule": list(schedule.values())}
 
 @router.put("/slots/block", response_model=dict)
-async def block_slot(
-    request: UpdateSlotRequest,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """
-    🚫 BLOCK/UNBLOCK SLOT
-    
-    Use cases:
-    - Emergency break
-    - Personal time
-    - Lunch break
-    """
-    
-    doctor = db.query(Doctor).filter(Doctor.user_id == current_user.id).first()
-    if not doctor:
-        raise HTTPException(status_code=404, detail="Doctor profile not found")
-    
-    slot = db.query(DoctorSlot).filter(
-        and_(
-            DoctorSlot.id == request.slot_id,
-            DoctorSlot.doctor_id == doctor.id
-        )
-    ).first()
-    
+async def block_slot(request: UpdateSlotRequest, doctor: Doctor = Depends(get_verified_doctor), db: Session = Depends(get_db)):
+    slot = db.query(DoctorSlot).filter(DoctorSlot.id == request.slot_id, DoctorSlot.doctor_id == doctor.id).with_for_update().first()
     if not slot:
         raise HTTPException(status_code=404, detail="Slot not found")
-    
     if slot.is_booked:
-        raise HTTPException(
-            status_code=400,
-            detail="Cannot block already booked slot. Cancel appointment first."
-        )
-    
+        raise HTTPException(status_code=400, detail="Cannot block booked slot. Cancel appointment first.")
     slot.is_blocked = request.is_blocked if request.is_blocked is not None else True
     slot.block_reason = request.reason
-    
     db.commit()
-
-    return {
-        "status": "success",
-        "slot_id": slot.id,
-        "is_blocked": slot.is_blocked,
-        "message": "Slot blocked" if slot.is_blocked else "Slot unblocked"
-    }
-
+    return {"status": "success", "slot_id": slot.id, "is_blocked": slot.is_blocked}
 
 @router.post("/leave/apply", response_model=dict)
-async def apply_leave(
-    request: LeaveRequest,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """
-    🏖 APPLY FOR LEAVE
-    
-    Blocks all slots in date range.
-    Agar kisi patient ka appointment already booked hai ussi range mein,
-    toh usse notification milegi ki doctor ne leave apply kiya hai.
-    """
-    
-    doctor = db.query(Doctor).filter(Doctor.user_id == current_user.id).first()
-    if not doctor:
-        raise HTTPException(status_code=404, detail="Doctor profile not found")
+async def apply_leave(request: LeaveRequest, doctor: Doctor = Depends(get_verified_doctor), db: Session = Depends(get_db)):
+    try:
+        locked_doctor = db.query(Doctor).filter(Doctor.id == doctor.id).with_for_update().first()
+        affected = db.query(Appointment).filter(Appointment.doctor_id == doctor.id, Appointment.date >= request.start_date, Appointment.date <= request.end_date, Appointment.status == "confirmed").with_for_update().all()
+        affected_ids = []
+        for apt in affected:
+            apt.status = "reschedule_required"
+            apt.updated_at = datetime.now()
+            affected_ids.append(apt.slot_id)
+            send_notification(db, apt.user_id, "Appointment needs rescheduling", f"Your appointment with Dr. {locked_doctor.name} on {apt.date.isoformat()} needs rescheduling - doctor unavailable.", "appointment", "appointment", str(apt.id))
 
-    # --- Pehle: booked appointments dhundho is date range mein ---
-    #     Taaki unke patients ko notification de sakein
-    booked_appointments = db.query(Appointment).filter(
-        and_(
-            Appointment.doctor_id == doctor.id,
-            Appointment.date >= request.start_date,
-            Appointment.date <= request.end_date,
-            Appointment.status == "confirmed"
-        )
-    ).all()
+        slots = db.query(DoctorSlot).filter(DoctorSlot.doctor_id == doctor.id, DoctorSlot.date >= request.start_date, DoctorSlot.date <= request.end_date).with_for_update().all()
+        for slot in slots:
+            slot.is_blocked = True
+            slot.block_reason = f"Doctor leave: {request.reason}"
+            if slot.id in affected_ids:
+                slot.is_booked = False
 
-    # Har booked patient ko notification bhejo
-    for apt in booked_appointments:
-        send_notification(
-            db=db,
-            user_id=apt.user_id,
-            title="⚠️ Doctor Leave Notice",
-            message=(
-                f"Dr. {doctor.name} ne {request.start_date} se {request.end_date} "
-                f"tak leave apply kiya hai. Aapka {apt.date} ka appointment affected ho sakta hai. "
-                f"Please apna appointment reschedule karein."
-            ),
-            notification_type="appointment",
-            related_entity_type="appointment",
-            related_entity_id=str(apt.id)
-        )
-
-    # --- Get all unbooked slots in date range ---
-    slots = db.query(DoctorSlot).filter(
-        and_(
-            DoctorSlot.doctor_id == doctor.id,
-            DoctorSlot.date >= request.start_date,
-            DoctorSlot.date <= request.end_date,
-            DoctorSlot.is_booked == False
-        )
-    ).all()
-    
-    # Block all available slots
-    blocked_count = 0
-    for slot in slots:
-        slot.is_blocked = True
-        slot.block_reason = f"Leave: {request.reason}"
-        blocked_count += 1
-    
-    # Set doctor as unavailable
-    doctor.is_available = False
-    
-    db.commit()
-    
-    return {
-        "status": "success",
-        "slots_blocked": blocked_count,
-        "leave_period": f"{request.start_date} to {request.end_date}",
-        "patients_notified": len(booked_appointments),
-        "message": "Leave applied successfully"
-    }
-
-
-# ==================== APPOINTMENTS MANAGEMENT ====================
+        db.add(AuditLog(user_id=doctor.user_id, action="DOCTOR_LEAVE_APPLIED", entity_type="doctor", entity_id=str(doctor.id), details={"start_date": request.start_date.isoformat(), "end_date": request.end_date.isoformat(), "affected": len(affected)}))
+        db.commit()
+        return {"status": "success", "leave_period": f"{request.start_date} to {request.end_date}", "patients_requiring_reschedule": len(affected), "message": "Leave applied and appointments marked for rescheduling."}
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Leave could not be applied")
 
 @router.get("/appointments/today", response_model=dict)
-async def get_today_appointments(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """
-    📋 TODAY'S APPOINTMENTS
-    """
-    
-    doctor = db.query(Doctor).filter(Doctor.user_id == current_user.id).first()
-    if not doctor:
-        raise HTTPException(status_code=404, detail="Doctor profile not found")
-    
-    appointments = db.query(Appointment).options(
-        joinedload(Appointment.user)
-    ).filter(
-        and_(
-            Appointment.doctor_id == doctor.id,
-            Appointment.date == date.today(),
-            Appointment.status == 'confirmed'
-        )
-    ).order_by(Appointment.time).all()
-    
-    return {
-        "date": str(date.today()),
-        "total": len(appointments),
-        "appointments": [
-            {
-                "id": apt.id,
-                "time": apt.time.strftime('%I:%M %p'),
-                "patient_name": apt.user.full_name,
-                "patient_phone": apt.user.phone,
-                "patient_age": apt.user.age,
-                "reason": apt.reason,
-                "symptoms": apt.symptoms,
-                "consultation_type": apt.consultation_type,
-                "is_emergency": apt.is_emergency
-            }
-            for apt in appointments
-        ]
-    }
-
+async def get_today_appointments(doctor: Doctor = Depends(get_verified_doctor), db: Session = Depends(get_db)):
+    appts = db.query(Appointment).options(joinedload(Appointment.user)).filter(Appointment.doctor_id == doctor.id, Appointment.date == date.today(), Appointment.status == 'confirmed').order_by(Appointment.time).all()
+    return {"date": str(date.today()), "total": len(appts), "appointments": [{"id": a.id, "time": a.time.strftime('%I:%M %p'), "patient_name": a.user.full_name, "patient_phone": mask_phone(a.user.phone), "reason": a.reason, "consultation_type": a.consultation_type} for a in appts]}
 
 @router.get("/appointments/upcoming", response_model=dict)
-async def get_upcoming_appointments(
-    current_user: User = Depends(get_current_user),
-    days: int = 7,
-    db: Session = Depends(get_db)
-):
-    """
-    📅 UPCOMING APPOINTMENTS (Next 7 days)
-    """
-    
-    doctor = db.query(Doctor).filter(Doctor.user_id == current_user.id).first()
-    if not doctor:
-        raise HTTPException(status_code=404, detail="Doctor profile not found")
-
+async def get_upcoming_appointments(doctor: Doctor = Depends(get_verified_doctor), days: int = Query(7, ge=1, le=30), db: Session = Depends(get_db)):
     end_date = date.today() + timedelta(days=days)
-    
-    appointments = db.query(Appointment).options(
-        joinedload(Appointment.user)
-    ).filter(
-        and_(
-            Appointment.doctor_id == doctor.id,
-            Appointment.date >= date.today(),
-            Appointment.date <= end_date,
-            Appointment.status == 'confirmed'
-        )
-    ).order_by(Appointment.date, Appointment.time).all()
-    
-    # Group by date
+    appts = db.query(Appointment).options(joinedload(Appointment.user)).filter(Appointment.doctor_id == doctor.id, Appointment.date >= date.today(), Appointment.date <= end_date, Appointment.status == 'confirmed').order_by(Appointment.date, Appointment.time).all()
     grouped = {}
-    for apt in appointments:
-        date_str = str(apt.date)
-        if date_str not in grouped:
-            grouped[date_str] = []
-        
-        grouped[date_str].append({
-            "id": apt.id,
-            "time": apt.time.strftime('%I:%M %p'),
-            "patient_name": apt.user.full_name,
-            "patient_phone": apt.user.phone,
-            "reason": apt.reason
-        })
-    
-    return {
-        "period": f"Next {days} days",
-        "total": len(appointments),
-        "appointments_by_date": grouped
-    }
-
+    for a in appts:
+        ds = str(a.date)
+        grouped.setdefault(ds, []).append({"id": a.id, "time": a.time.strftime('%I:%M %p'), "patient_name": a.user.full_name, "patient_phone": mask_phone(a.user.phone), "reason": a.reason})
+    return {"period": f"Next {days} days", "total": len(appts), "appointments_by_date": grouped}
 
 @router.post("/appointments/{appointment_id}/complete", response_model=dict)
-async def complete_appointment(
-    appointment_id: str,
-    diagnosis: Optional[str] = None,
-    prescription: Optional[dict] = None,
-    follow_up_required: bool = False,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """
-    ✅ MARK APPOINTMENT AS COMPLETED
-    
-    After consultation:
-    - Status "completed" set karta hai
-    - Prescription save karta hai (if provided)
-    - Doctor wallet mein consultation fee credit karta hai
-    - Patient ko completion notification bhejta hai
-    """
-    
-    doctor = db.query(Doctor).filter(Doctor.user_id == current_user.id).first()
-    if not doctor:
-        raise HTTPException(status_code=404, detail="Doctor profile not found")
+async def complete_appointment(appointment_id: str, diagnosis: Optional[str] = Query(None, max_length=3000), follow_up_required: bool = False, doctor: Doctor = Depends(get_verified_doctor), db: Session = Depends(get_db)):
+    """SECURITY: NEVER credits wallet. Money only via webhook/admin."""
+    try:
+        apt = db.query(Appointment).filter(Appointment.id == appointment_id, Appointment.doctor_id == doctor.id).with_for_update().first()
+        if not apt:
+            raise HTTPException(status_code=404, detail="Appointment not found")
+        if apt.status == "completed":
+            raise HTTPException(status_code=409, detail="Appointment already completed")
+        if apt.status!= "confirmed":
+            raise HTTPException(status_code=400, detail="Only confirmed appointments can be completed")
+        if datetime.combine(apt.date, apt.time) > datetime.now() + timedelta(minutes=15):
+            raise HTTPException(status_code=400, detail="Future appointments cannot be completed")
 
-    appointment = db.query(Appointment).filter(
-        and_(
-            Appointment.id == appointment_id,
-            Appointment.doctor_id == doctor.id
-        )
-    ).first()
-    
-    if not appointment:
-        raise HTTPException(status_code=404, detail="Appointment not found")
-    
-    appointment.status = "completed"
-    
-    # Increment consultation count
-    doctor.total_consultations += 1
-    
-    # Save diagnosis/prescription if provided
-    if diagnosis or prescription:
-        from database.models import Prescription
-        
-        prescription_record = Prescription(
-            user_id=appointment.user_id,
-            appointment_id=appointment.id,
-            doctor_id=doctor.id,
-            diagnosis=diagnosis,
-            medicines=prescription,
-            follow_up_required=follow_up_required,
-            valid_until=date.today() + timedelta(days=30)
-        )
-        db.add(prescription_record)
+        apt.status = "completed"
+        apt.updated_at = datetime.now()
+        doctor.total_consultations = int(doctor.total_consultations or 0) + 1
 
-    # --- Wallet mein consultation fee credit karo ---
-    wallet = db.query(DoctorWallet).filter(
-        DoctorWallet.doctor_id == doctor.id
-    ).first()
+        if diagnosis:
+            from database.models import Prescription
+            if not db.query(Prescription).filter(Prescription.appointment_id == apt.id).first():
+                db.add(Prescription(user_id=apt.user_id, appointment_id=apt.id, doctor_id=doctor.id, diagnosis=diagnosis, medicines={}, follow_up_required=follow_up_required, valid_until=date.today() + timedelta(days=30)))
 
-    if wallet:
-        credit_amount = doctor.consultation_fee
-
-        # Credit transaction create karo
-        credit_tx = WalletTransaction(
-            wallet_id=wallet.id,
-            amount=credit_amount,
-            transaction_type="credit",
-            description=f"Consultation fee — Appointment #{appointment.id}",
-            balance_before=wallet.current_balance,
-            balance_after=wallet.current_balance + credit_amount,
-        )
-        db.add(credit_tx)
-
-        # Wallet balance update karo
-        wallet.current_balance += credit_amount
-        wallet.total_earned += credit_amount
-
-    # --- Patient ko notification bhejo ---
-    send_notification(
-        db=db,
-        user_id=appointment.user_id,
-        title="✅ Consultation Completed",
-        message=(
-            f"Dr. {doctor.name} ke saath aapki consultation complete ho gayi hai. "
-            + (f"Diagnosis: {diagnosis}. " if diagnosis else "")
-            + ("Follow-up required hai. " if follow_up_required else "")
-            + "Prescription dekh sakte hain app mein."
-        ),
-        notification_type="appointment",
-        related_entity_type="appointment",
-        related_entity_id=str(appointment.id)
-    )
-    
-    db.commit()
-    
-    return {
-        "status": "success",
-        "appointment_id": appointment_id,
-        "message": "Appointment marked as completed",
-        "fee_credited": doctor.consultation_fee if wallet else 0
-    }
-
-
-# ==================== WALLET & EARNINGS ====================
+        send_notification(db, apt.user_id, "Consultation completed", "Your consultation has been marked as completed.", "appointment", "appointment", str(apt.id))
+        db.add(AuditLog(user_id=doctor.user_id, action="APPOINTMENT_COMPLETED", entity_type="appointment", entity_id=apt.id, details={"follow_up_required": follow_up_required, "wallet_credit_created": False}))
+        db.commit()
+        return {"status": "success", "appointment_id": apt.id, "message": "Appointment marked as completed", "fee_credited": 0, "note": "Wallet credit handled only by verified payment webhook or admin cash collection."}
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Appointment could not be completed")
 
 @router.get("/wallet", response_model=dict)
-async def get_wallet_details(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """
-    💰 VIEW WALLET BALANCE & EARNINGS
-    """
-    
-    doctor = db.query(Doctor).filter(Doctor.user_id == current_user.id).first()
-    if not doctor:
-        raise HTTPException(status_code=404, detail="Doctor profile not found")
-
-    wallet = db.query(DoctorWallet).filter(
-        DoctorWallet.doctor_id == doctor.id
-    ).first()
-    
+async def get_wallet_details(doctor: Doctor = Depends(get_verified_doctor), db: Session = Depends(get_db)):
+    wallet = db.query(DoctorWallet).filter(DoctorWallet.doctor_id == doctor.id).first()
     if not wallet:
         raise HTTPException(status_code=404, detail="Wallet not found")
-    
-    # Get recent transactions
-    transactions = db.query(WalletTransaction).filter(
-        WalletTransaction.wallet_id == wallet.id
-    ).order_by(desc(WalletTransaction.created_at)).limit(10).all()
-    
-    return {
-        "current_balance": wallet.current_balance,
-        "total_earned": wallet.total_earned,
-        "total_withdrawn": wallet.total_withdrawn,
-        "pending_withdrawal": wallet.pending_withdrawal or 0,
-        "can_withdraw": wallet.current_balance >= 500,  # Min ₹500
-        "recent_transactions": [
-            {
-                "type": tx.transaction_type,
-                "amount": tx.amount,
-                "description": tx.description,
-                "date": tx.created_at.strftime('%Y-%m-%d %I:%M %p'),
-                "balance_after": tx.balance_after
-            }
-            for tx in transactions
-        ]
-    }
-
+    txs = db.query(WalletTransaction).filter(WalletTransaction.wallet_id == wallet.id).order_by(desc(WalletTransaction.created_at)).limit(10).all()
+    return {"current_balance": wallet.current_balance, "total_earned": wallet.total_earned, "total_withdrawn": wallet.total_withdrawn, "pending_withdrawal": wallet.pending_withdrawal or 0, "can_withdraw": wallet.current_balance >= 500, "recent_transactions": [{"type": t.transaction_type, "amount": t.amount, "description": t.description, "date": t.created_at.strftime('%Y-%m-%d %I:%M %p'), "balance_after": t.balance_after} for t in txs]}
 
 @router.post("/wallet/withdraw", response_model=dict)
-async def withdraw_earnings(
-    request: WithdrawRequest,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """
-    💸 WITHDRAW EARNINGS TO BANK
-    
-    Min: ₹500
-    Processing: 2-3 business days
-    """
-    
-    doctor = db.query(Doctor).filter(Doctor.user_id == current_user.id).first()
-    if not doctor:
-        raise HTTPException(status_code=404, detail="Doctor profile not found")
-    
-    wallet = db.query(DoctorWallet).filter(
-        DoctorWallet.doctor_id == doctor.id
-    ).with_for_update().first()
-    
-    if not wallet:
-        raise HTTPException(status_code=404, detail="Wallet not found")
+async def withdraw_earnings(request: WithdrawRequest, doctor: Doctor = Depends(get_verified_doctor), db: Session = Depends(get_db)):
+    try:
+        wallet = db.query(DoctorWallet).filter(DoctorWallet.doctor_id == doctor.id).with_for_update().first()
+        if not wallet:
+            raise HTTPException(status_code=404, detail="Wallet not found")
+        if int(wallet.current_balance or 0) < request.amount:
+            raise HTTPException(status_code=400, detail="Insufficient wallet balance")
 
-    # Validation
-    if request.amount < 500:
-        raise HTTPException(
-            status_code=400,
-            detail="Minimum withdrawal amount is ₹500"
-        )
-    
-    if wallet.current_balance < request.amount:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Insufficient balance. Available: ₹{wallet.current_balance}"
-        )
-    
-    # Create withdrawal transaction
-    transaction = WalletTransaction(
-    wallet_id=wallet.id,
-    amount=request.amount,
-    transaction_type="withdrawal",
-    description=f"Withdrawal to {request.bank_account}",
-    balance_before=wallet.current_balance,
-    balance_after=wallet.current_balance - request.amount,
-)
-    db.add(transaction)
-    
-    # Update wallet
-    wallet.current_balance -= request.amount
-    wallet.total_withdrawn += request.amount
-    wallet.pending_withdrawal = (wallet.pending_withdrawal or 0) + request.amount
+        masked = f"****{request.bank_account[-4:]}"
+        before = int(wallet.current_balance or 0)
+        tx = WalletTransaction(wallet_id=wallet.id, amount=request.amount, transaction_type="withdrawal", description=f"Withdrawal request to {masked}", balance_before=before, balance_after=before-request.amount)
+        db.add(tx)
+        wallet.current_balance = before - request.amount
+        wallet.total_withdrawn = int(wallet.total_withdrawn or 0) + request.amount
+        wallet.pending_withdrawal = int(wallet.pending_withdrawal or 0) + request.amount
 
-    # --- Withdrawal notification doctor ko ---
-    send_notification(
-        db=db,
-        user_id=current_user.id,
-        title="💸 Withdrawal Request Submitted",
-        message=(
-            f"₹{request.amount} ka withdrawal request submit ho gaya hai. "
-            f"Bank account: ****{request.bank_account[-4:]}. "
-            f"2-3 business days mein credit ho jayega."
-        ),
-        notification_type="wallet",
-        related_entity_type="withdrawal",
-        related_entity_id=str(transaction.id)
-    )
-    
-    db.commit()
-    
-    return {
-        "status": "success",
-        "withdrawal_id": transaction.id,
-        "amount": request.amount,
-        "estimated_credit": "2-3 business days",
-        "new_balance": wallet.current_balance
-    }
-
-
-# ==================== ANALYTICS & STATS ====================
+        send_notification(db, doctor.user_id, "Withdrawal request submitted", f"Withdrawal ₹{request.amount} to {masked} submitted.", "wallet", "withdrawal", None)
+        db.add(AuditLog(user_id=doctor.user_id, action="WALLET_WITHDRAWAL_REQUESTED", entity_type="wallet", entity_id=str(wallet.id), details={"amount": request.amount, "bank_account_last4": request.bank_account[-4:]}))
+        db.commit()
+        db.refresh(tx)
+        return {"status": "success", "withdrawal_id": tx.id, "amount": request.amount, "estimated_credit": "2-3 business days", "new_balance": wallet.current_balance}
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Withdrawal could not be processed")
 
 @router.get("/analytics/overview", response_model=dict)
-async def get_analytics_overview(
-    current_user: User = Depends(get_current_user),
-    month: Optional[int] = None,
-    year: Optional[int] = None,
-    db: Session = Depends(get_db)
-):
-    """
-    📊 DOCTOR ANALYTICS DASHBOARD
-    """
-    
-    doctor = db.query(Doctor).filter(Doctor.user_id == current_user.id).first()
-    if not doctor:
-        raise HTTPException(status_code=404, detail="Doctor profile not found")
-    
-    # Default to current month
-    if not month:
-        month = datetime.now().month
-    if not year:
-        year = datetime.now().year
-    
-    # Total appointments this month
-    total_appointments = db.query(Appointment).filter(
-        and_(
-            Appointment.doctor_id == doctor.id,
-            extract('month', Appointment.date) == month,
-            extract('year', Appointment.date) == year
-        )
-    ).count()
-    
-    # Completed appointments
-    completed = db.query(Appointment).filter(
-        and_(
-            Appointment.doctor_id == doctor.id,
-            extract('month', Appointment.date) == month,
-            extract('year', Appointment.date) == year,
-            Appointment.status == 'completed'
-        )
-    ).count()
-    
-    # Cancelled appointments
-    cancelled = db.query(Appointment).filter(
-        and_(
-            Appointment.doctor_id == doctor.id,
-            extract('month', Appointment.date) == month,
-            extract('year', Appointment.date) == year,
-            Appointment.status == 'cancelled'
-        )
-    ).count()
-    
-    # Earnings this month
-    wallet = db.query(DoctorWallet).filter(
-        DoctorWallet.doctor_id == doctor.id
-    ).first()
-    
-    month_earnings = db.query(func.sum(WalletTransaction.amount)).filter(
-        and_(
-            WalletTransaction.wallet_id == wallet.id,
-            WalletTransaction.transaction_type == 'credit',
-            extract('month', WalletTransaction.created_at) == month,
-            extract('year', WalletTransaction.created_at) == year
-        )
-    ).scalar() or 0
-    
-    return {
-        "period": f"{month}/{year}",
-        "total_appointments": total_appointments,
-        "completed": completed,
-        "cancelled": cancelled,
-        "no_show": total_appointments - completed - cancelled,
-        "earnings_this_month": int(month_earnings),
-        "average_rating": float(doctor.rating),
-        "total_consultations_lifetime": doctor.total_consultations,
-        "wallet_balance": wallet.current_balance if wallet else 0
-    }
-
-
-# ==================== PROFILE ====================
+async def get_analytics_overview(doctor: Doctor = Depends(get_verified_doctor), month: Optional[int] = None, year: Optional[int] = None, db: Session = Depends(get_db)):
+    month = month or datetime.now().month
+    year = year or datetime.now().year
+    base = [Appointment.doctor_id == doctor.id, extract('month', Appointment.date) == month, extract('year', Appointment.date) == year]
+    total = db.query(Appointment).filter(*base).count()
+    completed = db.query(Appointment).filter(*base, Appointment.status == 'completed').count()
+    cancelled = db.query(Appointment).filter(*base, Appointment.status == 'cancelled').count()
+    wallet = db.query(DoctorWallet).filter(DoctorWallet.doctor_id == doctor.id).first()
+    month_earn = db.query(func.sum(WalletTransaction.amount)).filter(WalletTransaction.wallet_id == wallet.id if wallet else -1, WalletTransaction.transaction_type == 'credit', extract('month', WalletTransaction.created_at) == month, extract('year', WalletTransaction.created_at) == year).scalar() or 0 if wallet else 0
+    return {"period": f"{month}/{year}", "total_appointments": total, "completed": completed, "cancelled": cancelled, "no_show": total - completed - cancelled, "earnings_this_month": int(month_earn), "average_rating": float(doctor.rating or 0), "total_consultations_lifetime": doctor.total_consultations, "wallet_balance": wallet.current_balance if wallet else 0}
 
 @router.put("/profile/update", response_model=dict)
-async def update_doctor_profile(
-    request: UpdateDoctorProfileRequest,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """
-    ✏️ UPDATE DOCTOR PROFILE
-    """
-    
-    doctor = db.query(Doctor).filter(Doctor.user_id == current_user.id).first()
-    if not doctor:
-        raise HTTPException(status_code=404, detail="Doctor profile not found")
-
-    # Track kya changes hue — audit log ke liye
+async def update_doctor_profile(request: UpdateDoctorProfileRequest, doctor: Doctor = Depends(get_verified_doctor), db: Session = Depends(get_db)):
     changes = {}
-
     if request.consultation_fee is not None:
         changes["consultation_fee"] = {"old": doctor.consultation_fee, "new": request.consultation_fee}
         doctor.consultation_fee = request.consultation_fee
-    
     if request.specialties is not None:
         changes["specialties"] = {"old": doctor.specialties, "new": request.specialties}
         doctor.specialties = request.specialties
-    
+        doctor.specialization = request.specialties[0]
     if request.bio is not None:
-        changes["bio"] = {"old": doctor.bio, "new": request.bio}
+        changes["bio"] = {"old": getattr(doctor, 'bio', None), "new": request.bio}
         doctor.bio = request.bio
-    
     if request.is_available is not None:
         changes["is_available"] = {"old": doctor.is_available, "new": request.is_available}
         doctor.is_available = request.is_available
-
-    # --- Audit log: kya kya change hua ---
     if changes:
-        audit = AuditLog(
-            user_id=current_user.id,
-            action="DOCTOR_PROFILE_UPDATED",
-            entity_type="doctor",
-            entity_id=str(doctor.id),
-            details=changes
-        )
-        db.add(audit)
-    
+        db.add(AuditLog(user_id=doctor.user_id, action="DOCTOR_PROFILE_UPDATED", entity_type="doctor", entity_id=str(doctor.id), details=changes))
     db.commit()
-    
-    return {
-        "status": "success",
-        "message": "Profile updated successfully"
-    }
+    return {"status": "success", "message": "Profile updated successfully"}
