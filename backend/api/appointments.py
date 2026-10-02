@@ -759,6 +759,7 @@ async def search_doctors(
 
     filters = [
         Doctor.is_available.is_(True),
+        Doctor.is_verified.is_(True),
         Doctor.consultation_fee >= request.budget_min,
         Doctor.consultation_fee <= request.budget_max,
     ]
@@ -1008,6 +1009,7 @@ async def get_doctor_slots(
             DoctorSlot.doctor_id == doctor_id,
             DoctorSlot.date == slot_date,
             DoctorSlot.is_booked.is_(False),
+            DoctorSlot.is_blocked.is_(False), 
             *preference_filters,
         ]
 
@@ -1093,7 +1095,10 @@ async def book_appointment(
                 status_code=409,
                 detail="This time slot is already booked",
             )
-
+        
+        if slot.is_blocked:
+            raise HTTPException(status_code=409, detail="Slot is not available")
+            
         scheduled = appointment_datetime(request.date, slot.start_time)
         if scheduled < business_now() + MIN_BOOKING_NOTICE:
             raise HTTPException(
@@ -1990,7 +1995,7 @@ async def reschedule_appointment(
         if appointment.user_id != current_user.id:
             raise HTTPException(status_code=404, detail="Appointment not found")
 
-        if appointment.status != "confirmed":
+        if appointment.status not in {"confirmed", "reschedule_required"}:
             raise HTTPException(
                 status_code=400,
                 detail="Only confirmed appointments can be rescheduled",
